@@ -1,0 +1,65 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define CHUNK_SIZE 4
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer {
+    uint indexPipeIndex;
+    uint capacity;
+};
+layout(binding = 4) readonly buffer indexBuffer { float indexes[]; };
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint chunkIndex = gl_WorkGroupID.x;
+
+    const BatchInfo info = infos[batchIndex];
+    const float absolutePosition = indexes[batchIndex];
+    const uint nSlots = info.outputSizeX / info.inputSizeX;
+    if (isnan(absolutePosition) || isinf(absolutePosition) || absolutePosition < 0.0f || floor(absolutePosition) != absolutePosition)
+        return;
+    if (capacity > nSlots)
+        return;
+
+    const uint absoluteIndex = uint(absolutePosition);
+    const uint index = capacity == 0 ? absoluteIndex : absoluteIndex % capacity;
+    if (index >= nSlots)
+        return;
+
+    // Invalid duplicate slots are rejected by the host/runtime validation. This
+    // guard also prevents two Vulkan workgroups from racing if invalid input
+    // reaches the shader.
+    for (uint prior = 0; prior < batchIndex; prior++) {
+        const float priorPosition = indexes[prior];
+        if (isnan(priorPosition) || isinf(priorPosition) || priorPosition < 0.0f || floor(priorPosition) != priorPosition)
+            continue;
+        const uint priorAbsoluteIndex = uint(priorPosition);
+        const uint priorIndex = capacity == 0 ? priorAbsoluteIndex : priorAbsoluteIndex % capacity;
+        if (priorIndex == index)
+            return;
+    }
+
+    const uint offset = chunkIndex * CHUNK_SIZE;
+    const uint xOffset = info.inputOffset + offset;
+    const uint yOffset = index * info.inputSizeX + offset;
+
+    [[unroll]] for (uint i = 0; i < CHUNK_SIZE; i++) {
+        if (offset + i < info.inputSizeX)
+            y[yOffset + i] = x[xOffset + i];
+    }
+}

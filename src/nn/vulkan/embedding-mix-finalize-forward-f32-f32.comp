@@ -1,0 +1,37 @@
+#version 450
+
+#define N_THREADS 32
+
+layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer {
+    uint mode;
+    uint globalMaxBufferIndex;
+    float embeddingScale;
+    uint physicalSize;
+    uint temperaturePipeIndex;
+    uint useTemperature;
+};
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint hiddenIndex = gl_WorkGroupID.x * N_THREADS + gl_LocalInvocationID.x;
+    const BatchInfo info = infos[batchIndex];
+    if (hiddenIndex >= info.outputSizeX)
+        return;
+    const float denominator = x[info.inputOffset + info.outputSizeX];
+    y[info.outputOffset + hiddenIndex] =
+        x[info.inputOffset + hiddenIndex] * embeddingScale / denominator;
+}

@@ -1,0 +1,67 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+#define CHUNK_SIZE 4
+#define Q40_BLOCK_SIZE 32
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+struct BlockQ40 {
+    float16_t d;
+    uint8_t qs[Q40_BLOCK_SIZE / 2];
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly buffer weightBuffer { BlockQ40 weight[]; };
+layout(binding = 4) readonly uniform configBuffer {
+    uint vocabStart;
+    uint vocabSize;
+    float scale;
+};
+
+float weightValue(const uint row, const uint hiddenIndex, const uint rowBlocks) {
+    const BlockQ40 block = weight[row * rowBlocks + hiddenIndex / Q40_BLOCK_SIZE];
+    const uint index = hiddenIndex % Q40_BLOCK_SIZE;
+    const uint packed = block.qs[index % (Q40_BLOCK_SIZE / 2u)];
+    const int quant = index < Q40_BLOCK_SIZE / 2u
+        ? int(packed & 0xFu) - 8
+        : int(packed >> 4u) - 8;
+    return float(block.d) * float(quant);
+}
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint chunkIndex = gl_WorkGroupID.x;
+    const uint token = uint(x[batchIndex]);
+    const BatchInfo info = infos[batchIndex];
+    const uint offset = chunkIndex * CHUNK_SIZE;
+    const uint rowBlocks = info.outputSizeX / Q40_BLOCK_SIZE;
+    const bool local = vocabSize == 0 || (token >= vocabStart && token < vocabStart + vocabSize);
+    const float embeddingScale = scale == 0.0f ? 1.0f : scale;
+    if (local) {
+        const uint row = token - vocabStart;
+        [[unroll]] for (uint i = 0u; i < CHUNK_SIZE; ++i) {
+            const uint hiddenIndex = offset + i;
+            y[info.outputOffset + hiddenIndex] =
+                weightValue(row, hiddenIndex, rowBlocks) * embeddingScale;
+        }
+    } else {
+        [[unroll]] for (uint i = 0u; i < CHUNK_SIZE; ++i)
+            y[info.outputOffset + offset + i] = 0.0f;
+    }
+}

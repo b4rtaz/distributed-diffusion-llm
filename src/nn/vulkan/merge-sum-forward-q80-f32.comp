@@ -1,0 +1,68 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+#define CHUNK_SIZE 4
+#define Q80_BLOCK_SIZE 32
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+layout(constant_id = 1) const uint N_Z = 1;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+struct BlockQ80 {
+    float16_t d;
+    int8_t qs[Q80_BLOCK_SIZE];
+};
+
+layout(binding = 0) readonly buffer inputBuffer { BlockQ80 x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_Z * N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer { uint nGroups; };
+
+float q80Value(const uint baseBlock, const uint index) {
+    const BlockQ80 block = x[baseBlock + index / Q80_BLOCK_SIZE];
+    return float(block.d) * float(block.qs[index % Q80_BLOCK_SIZE]);
+}
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint chunkOffset = gl_WorkGroupID.x * CHUNK_SIZE;
+    if (nGroups != 0u) {
+        const BatchInfo inputInfo = infos[batchIndex];
+        const uint contributions =
+            (inputInfo.inputSizeX * Q80_BLOCK_SIZE) / (infos[batchIndex].outputSizeX * nGroups);
+        for (uint group = 0u; group < nGroups; ++group) {
+            const BatchInfo outputInfo = infos[group * N_BATCHES + batchIndex];
+            [[unroll]] for (uint i = 0u; i < CHUNK_SIZE; ++i) {
+                float sum = 0.0f;
+                for (uint contribution = 0u; contribution < contributions; ++contribution) {
+                    const uint index =
+                        (contribution * nGroups + group) * outputInfo.outputSizeX + chunkOffset + i;
+                    sum += q80Value(inputInfo.inputOffset, index);
+                }
+                y[outputInfo.outputOffset + chunkOffset + i] = sum;
+            }
+        }
+    } else {
+        const BatchInfo outputInfo = infos[batchIndex];
+        [[unroll]] for (uint i = 0u; i < CHUNK_SIZE; ++i) {
+            float sum = 0.0f;
+            for (uint z = 0u; z < N_Z; ++z) {
+                const BatchInfo inputInfo = infos[z * N_BATCHES + batchIndex];
+                sum += q80Value(inputInfo.inputOffset, chunkOffset + i);
+            }
+            y[outputInfo.outputOffset + chunkOffset + i] = sum;
+        }
+    }
+}

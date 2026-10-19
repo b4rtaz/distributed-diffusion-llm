@@ -1,0 +1,52 @@
+#version 450
+
+#define N_THREADS 128
+
+layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer {
+    uint mode;
+    uint globalMaxBufferIndex;
+    float embeddingScale;
+    uint physicalSize;
+    uint temperaturePipeIndex;
+    uint useTemperature;
+};
+layout(binding = 4) readonly buffer temperatureBuffer { float temperature[]; };
+
+shared float maxima[N_THREADS];
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint threadIndex = gl_LocalInvocationID.x;
+    const BatchInfo info = infos[batchIndex];
+    float maximum = -3.402823466e+38f;
+    for (uint i = threadIndex; i < info.inputSizeX; i += N_THREADS)
+        maximum = max(maximum, x[info.inputOffset + i]);
+    maxima[threadIndex] = maximum;
+    barrier();
+
+    for (uint width = N_THREADS / 2u; width != 0u; width /= 2u) {
+        if (threadIndex < width)
+            maxima[threadIndex] = max(maxima[threadIndex], maxima[threadIndex + width]);
+        barrier();
+    }
+    if (threadIndex == 0u) {
+        const float scale = mode == 0u && useTemperature != 0u
+            ? 1.0f / temperature[0]
+            : 1.0f;
+        y[info.outputOffset] = maxima[0] * scale;
+    }
+}

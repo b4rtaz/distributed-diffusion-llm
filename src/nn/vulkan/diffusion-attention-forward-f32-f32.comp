@@ -1,0 +1,119 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float query[]; };
+layout(binding = 1) buffer outputBuffer { float outputValues[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer {
+    uint mode;
+    uint nQueryHeads;
+    uint nKvHeads;
+    uint globalNQueryHeads;
+    uint globalNKvHeads;
+    uint queryHeadStart;
+    uint kvHeadStart;
+    uint headDim;
+    uint slidingWindow;
+    uint cacheCapacity;
+    float scoreScale;
+    uint positionPipeIndex;
+    uint prefixLengthPipeIndex;
+    uint currentKeyBufferIndex;
+    uint currentValueBufferIndex;
+    uint keyCacheBufferIndex;
+    uint valueCacheBufferIndex;
+};
+layout(binding = 4) readonly buffer positionsBuffer { float positions[]; };
+layout(binding = 5) readonly buffer prefixLengthBuffer { float prefixLengthValue[]; };
+layout(binding = 6) readonly buffer currentKeyBuffer { float currentKey[]; };
+layout(binding = 7) readonly buffer currentValueBuffer { float currentValue[]; };
+layout(binding = 8) readonly buffer keyCacheBuffer { float keyCache[]; };
+layout(binding = 9) readonly buffer valueCacheBuffer { float valueCache[]; };
+
+void accumulateValue(
+    const uint outputOffset,
+    const uint valueOffset,
+    const float score,
+    inout float runningMax,
+    inout float runningSum,
+    const bool cached)
+{
+    const float nextMax = max(runningMax, score);
+    const float oldScale = runningSum == 0.0f ? 0.0f : exp(runningMax - nextMax);
+    const float newScale = exp(score - nextMax);
+    for (uint d = 0u; d < headDim; ++d) {
+        const float value = cached ? valueCache[valueOffset + d] : currentValue[valueOffset + d];
+        outputValues[outputOffset + d] = outputValues[outputOffset + d] * oldScale + value * newScale;
+    }
+    runningSum = runningSum * oldScale + newScale;
+    runningMax = nextMax;
+}
+
+void main() {
+    const uint queryIndex = gl_WorkGroupID.y;
+    const uint localQueryHead = gl_WorkGroupID.x;
+    const BatchInfo info = infos[queryIndex];
+    const uint queryLength = gl_NumWorkGroups.y;
+    const uint kvDim = nKvHeads * headDim;
+    const uint kvGroup = globalNQueryHeads / globalNKvHeads;
+    const uint globalQueryHead = queryHeadStart + localQueryHead;
+    const uint globalKvHead = globalQueryHead / kvGroup;
+    if (globalKvHead < kvHeadStart || globalKvHead >= kvHeadStart + nKvHeads)
+        return;
+    const uint localKvHead = globalKvHead - kvHeadStart;
+    const uint qOffset = info.inputOffset + localQueryHead * headDim;
+    const uint outputOffset = info.outputOffset + localQueryHead * headDim;
+    for (uint d = 0u; d < headDim; ++d)
+        outputValues[outputOffset + d] = 0.0f;
+
+    const uint prefixLength = uint(prefixLengthValue[0]);
+    const uint queryPosition = uint(positions[queryIndex]);
+    uint prefixStart = 0u;
+    if (slidingWindow != 0u) {
+        const uint windowEnd = mode == 0u ? queryPosition + 1u : prefixLength;
+        prefixStart = windowEnd > slidingWindow ? windowEnd - slidingWindow : 0u;
+    }
+    uint prefixEnd = prefixLength;
+    if (mode == 0u)
+        prefixEnd = min(prefixEnd, queryPosition + 1u);
+
+    float runningMax = -3.402823466e+38f;
+    float runningSum = 0.0f;
+    for (uint absolute = prefixStart; absolute < prefixEnd; ++absolute) {
+        const uint slot = slidingWindow == 0u ? absolute : absolute % cacheCapacity;
+        const uint kvOffset = slot * kvDim + localKvHead * headDim;
+        float score = 0.0f;
+        for (uint d = 0u; d < headDim; ++d)
+            score += query[qOffset + d] * keyCache[kvOffset + d];
+        accumulateValue(outputOffset, kvOffset, score * scoreScale, runningMax, runningSum, true);
+    }
+
+    for (uint keyIndex = 0u; keyIndex < queryLength; ++keyIndex) {
+        const uint keyPosition = uint(positions[keyIndex]);
+        if (mode == 0u && keyPosition > queryPosition)
+            continue;
+        if (mode == 0u && slidingWindow != 0u && keyPosition < prefixStart)
+            continue;
+        const uint kvOffset = keyIndex * kvDim + localKvHead * headDim;
+        float score = 0.0f;
+        for (uint d = 0u; d < headDim; ++d)
+            score += query[qOffset + d] * currentKey[kvOffset + d];
+        accumulateValue(outputOffset, kvOffset, score * scoreScale, runningMax, runningSum, false);
+    }
+
+    if (runningSum > 0.0f) {
+        const float inverse = 1.0f / runningSum;
+        for (uint d = 0u; d < headDim; ++d)
+            outputValues[outputOffset + d] *= inverse;
+    }
+}

@@ -1,0 +1,88 @@
+#version 450
+
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+
+#define N_THREADS 32
+#define Q40_BLOCK_SIZE 32
+
+layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+struct BlockQ40 {
+    float16_t d;
+    uint8_t qs[Q40_BLOCK_SIZE / 2];
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float logits[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float outputValues[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly buffer weightBuffer { BlockQ40 embedding[]; };
+layout(binding = 4) readonly uniform configBuffer {
+    uint mode;
+    uint globalMaxBufferIndex;
+    float embeddingScale;
+    uint physicalSize;
+    uint temperaturePipeIndex;
+    uint useTemperature;
+};
+layout(binding = 5) readonly buffer globalMaxBuffer { float globalMax[]; };
+layout(binding = 6) readonly buffer temperatureBuffer { float temperature[]; };
+
+shared float probabilities[N_THREADS];
+
+float embeddingValue(const uint token, const uint hiddenIndex, const uint rowBlocks) {
+    const BlockQ40 block = embedding[token * rowBlocks + hiddenIndex / Q40_BLOCK_SIZE];
+    const uint index = hiddenIndex % Q40_BLOCK_SIZE;
+    const uint packed = block.qs[index % (Q40_BLOCK_SIZE / 2u)];
+    const int quant = index < Q40_BLOCK_SIZE / 2u
+        ? int(packed & 0xFu) - 8
+        : int(packed >> 4u) - 8;
+    return float(block.d) * float(quant);
+}
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint lane = gl_LocalInvocationID.x;
+    const uint hiddenIndex = gl_WorkGroupID.x * N_THREADS + lane;
+    const BatchInfo info = infos[batchIndex];
+    const uint rowBlocks = uint(embedding.length()) / info.inputSizeX;
+    const uint hiddenSize = rowBlocks * Q40_BLOCK_SIZE;
+    const float logitScale = useTemperature != 0u ? 1.0f / temperature[0] : 1.0f;
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+
+    for (uint tokenBase = 0u; tokenBase < info.inputSizeX; tokenBase += N_THREADS) {
+        const uint token = tokenBase + lane;
+        probabilities[lane] = token < info.inputSizeX
+            ? exp(logits[info.inputOffset + token] * logitScale - globalMax[batchIndex])
+            : 0.0f;
+        barrier();
+        const uint count = min(N_THREADS, info.inputSizeX - tokenBase);
+        if (hiddenIndex < hiddenSize) {
+            for (uint i = 0u; i < count; ++i)
+                numerator += probabilities[i] * embeddingValue(tokenBase + i, hiddenIndex, rowBlocks);
+        }
+        if (gl_WorkGroupID.x == 0u && lane == 0u) {
+            for (uint i = 0u; i < count; ++i)
+                denominator += probabilities[i];
+        }
+        barrier();
+    }
+
+    if (gl_WorkGroupID.x == 0u && lane == 0u)
+        outputValues[info.outputOffset + hiddenSize] = denominator;
+    if (hiddenIndex < hiddenSize)
+        outputValues[info.outputOffset + hiddenIndex] = numerator;
+    else if (hiddenIndex > hiddenSize && hiddenIndex < info.outputSizeX)
+        outputValues[info.outputOffset + hiddenIndex] = 0.0f;
+}
