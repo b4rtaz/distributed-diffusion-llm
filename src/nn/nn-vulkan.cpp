@@ -574,12 +574,18 @@ static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuant
     }
     if (opCode == OP_TIED_EMBEDDING) {
         const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
+        if (config->mode == TIED_EMBEDDING_PARTIAL) {
+            if (quantType == F32_F32_F32) return "tied-embedding-partial-forward-f32-f32-f32.spv";
+            if (quantType == Q80_Q40_F32) return "tied-embedding-partial-forward-q80-q40-f32.spv";
+        }
+        if (config->mode == TIED_EMBEDDING_REDUCE) {
+            if (quantType == F32_F32_F32) return "tied-embedding-reduce-forward-f32-f32.spv";
+        }
+        if (config->mode == TIED_EMBEDDING_RESCALE) {
+            if (quantType == F32_F32_F32) return "tied-embedding-rescale-forward-f32-f32.spv";
+        }
         if (config->mode == TIED_EMBEDDING_LOCAL_MAX || config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
             if (quantType == F32_F32_F32) return "embedding-mix-max-forward-f32-f32.spv";
-        }
-        if (config->mode == TIED_EMBEDDING_LOCAL_SUM) {
-            if (quantType == F32_F32_F32) return "embedding-mix-sum-forward-f32-f32-f32.spv";
-            if (quantType == F32_Q40_F32) return "embedding-mix-sum-forward-f32-q40-f32.spv";
         }
         if (config->mode == TIED_EMBEDDING_FINALIZE) {
             if (quantType == F32_F32_F32) return "embedding-mix-finalize-forward-f32-f32.spv";
@@ -710,10 +716,15 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
         } break;
         case OP_TIED_EMBEDDING: {
             const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
-            if (config->mode == TIED_EMBEDDING_LOCAL_MAX || config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
+            if (config->mode == TIED_EMBEDDING_PARTIAL) {
+                a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->partialBufferIndex)});
                 a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
-            } else if (config->mode == TIED_EMBEDDING_LOCAL_SUM) {
+            } else if (config->mode == TIED_EMBEDDING_REDUCE) {
+                a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->embeddingMixBufferIndex)});
+            } else if (config->mode == TIED_EMBEDDING_RESCALE) {
+                a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->vocabularyMaxPipeIndex)});
                 a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->globalMaxBufferIndex)});
+            } else if (config->mode == TIED_EMBEDDING_LOCAL_MAX || config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
                 a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
             }
         } break;
@@ -832,6 +843,13 @@ static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, co
         consts.push_back(inputSize.x);
         consts.push_back(config->k);
     }
+    if (opConfig->code == OP_TIED_EMBEDDING) {
+        const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
+        if (config->mode == TIED_EMBEDDING_PARTIAL)
+            consts.push_back(config->hiddenSize);
+        else if (config->mode == TIED_EMBEDDING_REDUCE)
+            consts.push_back(config->tileCount);
+    }
     return consts;
 }
 
@@ -868,7 +886,10 @@ static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const
         return ((NnDiffusionAttentionOpConfig *)opConfig->config)->nQueryHeads;
     if (opConfig->code == OP_TIED_EMBEDDING) {
         const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
-        if (config->mode == TIED_EMBEDDING_LOCAL_SUM || config->mode == TIED_EMBEDDING_FINALIZE) {
+        if (config->mode == TIED_EMBEDDING_PARTIAL)
+            return config->tileCount;
+        if (config->mode == TIED_EMBEDDING_RESCALE ||
+            config->mode == TIED_EMBEDDING_FINALIZE) {
             constexpr NnUint chunkSize = 32u; // Shader local size
             return (outputSize.x + chunkSize - 1u) / chunkSize;
         }

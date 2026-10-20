@@ -1,0 +1,48 @@
+#version 450
+
+#define N_THREADS 32
+
+layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer {
+    uint mode;
+    uint embeddingMixBufferIndex;
+    uint vocabularyMaxPipeIndex;
+    uint globalMaxBufferIndex;
+    uint temperaturePipeIndex;
+    uint nodeIndex;
+    uint nNodes;
+    uint physicalSize;
+    float embeddingScale;
+    float logitSoftcap;
+    uint useTemperature;
+    uint partialBufferIndex;
+    uint tileSize;
+    uint tileCount;
+    uint hiddenSize;
+};
+layout(binding = 4) readonly buffer localMaximumBuffer { float localMaximum[]; };
+layout(binding = 5) readonly buffer globalMaximumBuffer { float globalMaximum[]; };
+
+void main() {
+    const uint batch = gl_WorkGroupID.y;
+    const uint index = gl_WorkGroupID.x * N_THREADS + gl_LocalInvocationID.x;
+    const BatchInfo info = infos[batch];
+    if (index >= info.outputSizeX)
+        return;
+    const float scale = exp(
+        localMaximum[batch * nNodes + nodeIndex] - globalMaximum[batch]);
+    y[info.outputOffset + index] = x[info.inputOffset + index] * scale;
+}

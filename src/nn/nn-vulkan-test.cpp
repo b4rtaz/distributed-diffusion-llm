@@ -670,75 +670,110 @@ void testEmbeddingMixMax_F32_F32() {
 }
 
 template <bool quantized>
-void testEmbeddingMixSum_F32() {
+void testTiedEmbedding_F32() {
     execute(
         [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *nodeBuilder, NnSegmentConfigBuilder *segmentBuilder) {
+            const NnUint tileSize = 2u;
+            const NnUint tileCount = (EMBEDDING_MIX_VOCAB + tileSize - 1u) / tileSize;
+            const NnUint hiddenPipeIndex = netBuilder->addPipe("hidden",
+                size2D(quantized ? F_Q80 : F_32, N_BATCHES, EMBEDDING_MIX_HIDDEN));
+            const NnUint temperaturePipeIndex = netBuilder->addPipe("temperature", size1D(F_32, 1u));
             const NnUint logitsPipeIndex = netBuilder->addPipe("logits",
                 size2D(F_32, N_BATCHES, EMBEDDING_MIX_VOCAB));
-            const NnUint temperaturePipeIndex = netBuilder->addPipe("temperature", size1D(F_32, 1u));
+            const NnUint maximumPipeIndex = netBuilder->addPipe("maximum",
+                size2D(F_32, N_BATCHES, 1u));
             const NnUint outputPipeIndex = netBuilder->addPipe("output",
                 size2D(F_32, N_BATCHES, EMBEDDING_MIX_HIDDEN));
+            netBuilder->addPreSync(hiddenPipeIndex);
             netBuilder->addPreSync(temperaturePipeIndex);
-            const NnUint globalMaxBufferIndex = nodeBuilder->addBuffer("global_max", size2D(F_32, N_BATCHES, 1u));
-            const NnUint localSumBufferIndex = nodeBuilder->addBuffer("local_sum",
+            const NnUint partialBufferIndex = nodeBuilder->addBuffer("partials",
+                size2D(F_32, N_BATCHES, tileCount * EMBEDDING_MIX_PHYSICAL));
+            const NnUint localMixBufferIndex = nodeBuilder->addBuffer("local_mix",
                 size2D(F_32, N_BATCHES, EMBEDDING_MIX_PHYSICAL));
-            segmentBuilder->addOp(OP_TIED_EMBEDDING, "embedding_mix_weight", 0u,
+            segmentBuilder->addOp(OP_TIED_EMBEDDING, "tied_embedding_weight", 0u,
+                pointerBatchConfig(SRC_PIPE, hiddenPipeIndex),
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
-                pointerBatchConfig(SRC_BUFFER, localSumBufferIndex),
                 size2D(quantized ? F_Q40 : F_32, EMBEDDING_MIX_VOCAB, EMBEDDING_MIX_HIDDEN),
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_SUM, 0u, 0u,
-                    globalMaxBufferIndex, temperaturePipeIndex, 0u, 1u,
-                    EMBEDDING_MIX_PHYSICAL, 1.0f, 0.0f, 1u});
-            segmentBuilder->addOp(OP_TIED_EMBEDDING, "embedding_mix_finalize", 0u,
-                pointerBatchConfig(SRC_BUFFER, localSumBufferIndex),
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_PARTIAL, 0u, 0u, 0u,
+                    temperaturePipeIndex, 0u, 1u, EMBEDDING_MIX_PHYSICAL,
+                    1.0f, 2.5f, 1u, partialBufferIndex, tileSize, tileCount,
+                    EMBEDDING_MIX_HIDDEN});
+            segmentBuilder->addOp(OP_TIED_EMBEDDING, "tied_embedding_reduce", 0u,
+                pointerBatchConfig(SRC_BUFFER, partialBufferIndex),
+                pointerBatchConfig(SRC_PIPE, maximumPipeIndex), size0(),
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_REDUCE, localMixBufferIndex,
+                    maximumPipeIndex,
+                    0u, 0u, 0u, 1u, EMBEDDING_MIX_PHYSICAL,
+                    1.0f, 0.0f, 0u, partialBufferIndex, tileSize, tileCount,
+                    EMBEDDING_MIX_HIDDEN});
+            segmentBuilder->addOp(OP_TIED_EMBEDDING, "tied_embedding_finalize", 0u,
+                pointerBatchConfig(SRC_BUFFER, localMixBufferIndex),
                 pointerBatchConfig(SRC_PIPE, outputPipeIndex), size0(),
                 NnTiedEmbeddingOpConfig{TIED_EMBEDDING_FINALIZE, 0u, 0u, 0u,
-                    temperaturePipeIndex, 0u, 1u, EMBEDDING_MIX_PHYSICAL,
-                    2.0f, 0.0f, 0u});
+                    0u, 0u, 1u, EMBEDDING_MIX_PHYSICAL, 2.0f, 0.0f, 0u});
         },
-        [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
+        [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *) {
             const NnUint batchSize = 2u;
             execution->setBatchSize(batchSize);
-            float *logits = (float *)execution->pipes[0];
-            const float logitValues[] = {0.0f, 0.5f, 1.0f, 1.5f, 1.0f, -1.0f, 0.0f, 2.0f};
-            std::copy(logitValues, logitValues + 8u, logits);
             const float temperature = 0.5f;
             ((float *)execution->pipes[1])[0] = temperature;
+
+            float hidden[batchSize * EMBEDDING_MIX_HIDDEN];
+            float effectiveHidden[batchSize * EMBEDDING_MIX_HIDDEN];
+            for (NnUint batch = 0u; batch < batchSize; ++batch)
+                for (NnUint h = 0u; h < EMBEDDING_MIX_HIDDEN; ++h)
+                    hidden[batch * EMBEDDING_MIX_HIDDEN + h] =
+                        float(int((batch + 2u) * (h + 3u) % 17u) - 8) * 0.025f;
+            if (quantized) {
+                NnBlockQ80 *packed = (NnBlockQ80 *)execution->pipes[0];
+                quantizeF32toQ80(hidden, packed, batchSize * EMBEDDING_MIX_HIDDEN, 1u, 0u);
+                dequantizeQ80toF32(packed, effectiveHidden,
+                    batchSize * EMBEDDING_MIX_HIDDEN, 1u, 0u);
+            } else {
+                std::copy(hidden, hidden + batchSize * EMBEDDING_MIX_HIDDEN,
+                    (float *)execution->pipes[0]);
+                std::copy(hidden, hidden + batchSize * EMBEDDING_MIX_HIDDEN, effectiveHidden);
+            }
 
             float embedding[EMBEDDING_MIX_VOCAB * EMBEDDING_MIX_HIDDEN];
             for (NnUint token = 0u; token < EMBEDDING_MIX_VOCAB; ++token)
                 for (NnUint h = 0u; h < EMBEDDING_MIX_HIDDEN; ++h)
                     embedding[token * EMBEDDING_MIX_HIDDEN + h] =
-                        ((float)(token + 1u) * 0.25f) + (float)h * 0.01f;
+                        float(int((token + 1u) * (h + 5u) % 19u) - 9) * 0.02f;
             float effectiveEmbedding[EMBEDDING_MIX_VOCAB * EMBEDDING_MIX_HIDDEN];
             if (quantized) {
                 NnBlockQ40 packed[EMBEDDING_MIX_VOCAB * EMBEDDING_MIX_HIDDEN / Q40_BLOCK_SIZE];
-                quantizeF32toQ40(embedding, packed, EMBEDDING_MIX_VOCAB * EMBEDDING_MIX_HIDDEN, 1u, 0u);
+                quantizeF32toQ40(embedding, packed,
+                    EMBEDDING_MIX_VOCAB * EMBEDDING_MIX_HIDDEN, 1u, 0u);
                 dequantizeQ40toF32(packed, effectiveEmbedding,
                     EMBEDDING_MIX_VOCAB * EMBEDDING_MIX_HIDDEN, 1u, 0u);
-                executor->loadWeight("embedding_mix_weight", 0u, 0u, sizeof(packed), (NnByte *)packed);
+                executor->loadWeight("tied_embedding_weight", 0u, 0u,
+                    sizeof(packed), (NnByte *)packed);
             } else {
                 std::copy(embedding, embedding + EMBEDDING_MIX_VOCAB * EMBEDDING_MIX_HIDDEN,
                     effectiveEmbedding);
-                executor->loadWeight("embedding_mix_weight", 0u, 0u, sizeof(embedding), (NnByte *)embedding);
+                executor->loadWeight("tied_embedding_weight", 0u, 0u,
+                    sizeof(embedding), (NnByte *)embedding);
             }
-
-            float maxima[N_BATCHES] = {0.0f};
-            for (NnUint batch = 0u; batch < batchSize; ++batch) {
-                maxima[batch] = logits[batch * EMBEDDING_MIX_VOCAB] / temperature;
-                for (NnUint token = 1u; token < EMBEDDING_MIX_VOCAB; ++token)
-                    maxima[batch] = std::max(maxima[batch],
-                        logits[batch * EMBEDDING_MIX_VOCAB + token] / temperature);
-            }
-            device->data.buffers[0].get()->write((const NnByte *)maxima);
 
             float expected[batchSize * EMBEDDING_MIX_HIDDEN];
+            float expectedLogits[batchSize * EMBEDDING_MIX_VOCAB];
             for (NnUint batch = 0u; batch < batchSize; ++batch) {
+                float maximum = -INFINITY;
+                for (NnUint token = 0u; token < EMBEDDING_MIX_VOCAB; ++token) {
+                    float raw = 0.0f;
+                    for (NnUint h = 0u; h < EMBEDDING_MIX_HIDDEN; ++h)
+                        raw += effectiveHidden[batch * EMBEDDING_MIX_HIDDEN + h] *
+                            effectiveEmbedding[token * EMBEDDING_MIX_HIDDEN + h];
+                    const float logit = 2.5f * tanhf(raw / 2.5f);
+                    expectedLogits[batch * EMBEDDING_MIX_VOCAB + token] = logit;
+                    maximum = std::max(maximum, logit / temperature);
+                }
                 float denominator = 0.0f;
                 float probabilities[EMBEDDING_MIX_VOCAB];
                 for (NnUint token = 0u; token < EMBEDDING_MIX_VOCAB; ++token) {
                     probabilities[token] = expf(
-                        logits[batch * EMBEDDING_MIX_VOCAB + token] / temperature - maxima[batch]);
+                        expectedLogits[batch * EMBEDDING_MIX_VOCAB + token] / temperature - maximum);
                     denominator += probabilities[token];
                 }
                 for (NnUint h = 0u; h < EMBEDDING_MIX_HIDDEN; ++h) {
@@ -751,10 +786,13 @@ void testEmbeddingMixSum_F32() {
             }
 
             executor->forward();
-            const float *actual = (const float *)execution->pipes[2];
+            const float *actualLogits = (const float *)execution->pipes[2];
+            const float *actual = (const float *)execution->pipes[4];
+            for (NnUint i = 0u; i < batchSize * EMBEDDING_MIX_VOCAB; ++i)
+                assertFloat(i, actualLogits[i], expectedLogits[i], 0.0001f);
             for (NnUint i = 0u; i < batchSize * EMBEDDING_MIX_HIDDEN; ++i)
-                assertFloat(i, actual[i], expected[i], quantized ? 0.0001f : 0.00001f);
-            printOk(quantized ? "testEmbeddingMixSum_Q40" : "testEmbeddingMixSum_F32");
+                assertFloat(i, actual[i], expected[i], quantized ? 0.001f : 0.0001f);
+            printOk(quantized ? "testTiedEmbedding_Q40" : "testTiedEmbedding_F32");
         });
 }
 
@@ -1836,8 +1874,8 @@ int main() {
     testShardedEmbedding_F32<true>();
 
     testEmbeddingMixMax_F32_F32();
-    testEmbeddingMixSum_F32<false>();
-    testEmbeddingMixSum_F32<true>();
+    testTiedEmbedding_F32<false>();
+    testTiedEmbedding_F32<true>();
 
     testVocabStats_F32_F32();
 

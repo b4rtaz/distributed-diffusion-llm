@@ -49,7 +49,7 @@ void main() {
         barrier();
     }
     if (threadIndex == 0u) {
-        const float scale = mode == 0u && useTemperature != 0u
+        const float scale = useTemperature != 0u
             ? 1.0f / temperature[0]
             : 1.0f;
         y[info.outputOffset] = maxima[0] * scale;

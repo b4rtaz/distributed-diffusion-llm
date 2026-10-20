@@ -349,12 +349,12 @@ typedef struct {
 } NnDiffusionAttentionOpConfig;
 
 enum NnTiedEmbeddingMode {
-    TIED_EMBEDDING_LOCAL = 0,
     TIED_EMBEDDING_RESCALE = 1,
     TIED_EMBEDDING_FINALIZE = 2,
     TIED_EMBEDDING_LOCAL_MAX = 3,
-    TIED_EMBEDDING_LOCAL_SUM = 4,
     TIED_EMBEDDING_GLOBAL_MAX = 5,
+    TIED_EMBEDDING_PARTIAL = 6,
+    TIED_EMBEDDING_REDUCE = 7,
 };
 
 typedef struct {
@@ -369,7 +369,13 @@ typedef struct {
     float embeddingScale;
     float logitSoftcap;
     NnUint useTemperature;
+    NnUint partialBufferIndex;
+    NnUint tileSize;
+    NnUint tileCount;
+    NnUint hiddenSize;
 } NnTiedEmbeddingOpConfig;
+
+#define NN_TIED_EMBEDDING_VULKAN_TILE_SIZE 8192u
 
 #define NN_VOCAB_STATS_WIDTH 5u
 #define NN_VOCAB_MICROSHARDS 8u

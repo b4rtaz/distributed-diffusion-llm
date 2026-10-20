@@ -608,80 +608,13 @@ void testDiffusionAttention() {
     compare_F32("diffusionAttentionNoPrefix", actual, expected, queryLength * qHeads * headDim, 0.00001f);
 }
 
-void testEmbeddingMix() {
-    const NnUint vocab = 3u;
-    const NnUint hidden = 32u;
-    const NnUint physical = 40u;
-    const NnUint batches = 3u;
-    const NnUint threads = 2u;
-    float logits[batches][vocab] = {
-        {0.2f, 1.0f, -0.4f},
-        {-0.3f, 0.1f, 0.8f},
-        {1.3f, -0.2f, 0.4f}
-    };
-    std::vector<float> embedding(vocab * hidden);
-    for (NnUint token = 0u; token < vocab; token++)
-        for (NnUint h = 0u; h < hidden; h++)
-            embedding[token * hidden + h] = (float)(token + 1u) * 0.1f + (float)h * 0.001f;
-
-    float maxima[batches];
-    float expected[batches][hidden];
-    for (NnUint batch = 0u; batch < batches; ++batch) {
-        maxima[batch] = *std::max_element(logits[batch], logits[batch] + vocab);
-        float probabilities[vocab];
-        std::memcpy(probabilities, logits[batch], sizeof(probabilities));
-        softmax_F32(probabilities, vocab);
-        for (NnUint h = 0u; h < hidden; ++h) {
-            expected[batch][h] = 0.0f;
-            for (NnUint token = 0u; token < vocab; ++token)
-                expected[batch][h] += probabilities[token] * embedding[token * hidden + h] * 2.0f;
-        }
-    }
-
-    NnByte *logitRows[batches];
-    float partial[batches][physical];
-    NnByte *partialRows[batches];
-    for (NnUint batch = 0u; batch < batches; ++batch) {
-        logitRows[batch] = reinterpret_cast<NnByte *>(logits[batch]);
-        partialRows[batch] = reinterpret_cast<NnByte *>(partial[batch]);
-        std::fill(partial[batch], partial[batch] + physical, -1.0f);
-    }
-
-    const auto run = [&](const NnByte *weights, NnFloatType type) {
-        for (NnUint thread = 0u; thread < threads; ++thread) {
-            SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
-            embeddingMixLocalSum_F32(partialRows, logitRows, weights, type,
-                vocab, hidden, physical, maxima, batchStart, batchEnd);
-        }
-    };
-
-    run(reinterpret_cast<const NnByte *>(embedding.data()), F_32);
-    float actual[batches][hidden];
-    for (NnUint batch = 0u; batch < batches; ++batch) {
-        for (NnUint h = 0u; h < hidden; ++h)
-            actual[batch][h] = partial[batch][h] * 2.0f / partial[batch][hidden];
-        compare_F32("embeddingMixF32", actual[batch], expected[batch], hidden, 0.00001f);
-        for (NnUint h = hidden + 1u; h < physical; ++h)
-            assert(partial[batch][h] == 0.0f);
-    }
-
-    std::vector<NnBlockQ40> quantized(vocab * hidden / Q40_BLOCK_SIZE);
-    quantizeF32toQ40(embedding.data(), quantized.data(), vocab * hidden, 1u, 0u);
-    run(reinterpret_cast<const NnByte *>(quantized.data()), F_Q40);
-    for (NnUint batch = 0u; batch < batches; ++batch) {
-        for (NnUint h = 0u; h < hidden; ++h)
-            actual[batch][h] = partial[batch][h] * 2.0f / partial[batch][hidden];
-        compare_F32("embeddingMixQ40", actual[batch], expected[batch], hidden, 0.03f);
-        for (NnUint h = hidden + 1u; h < physical; ++h)
-            assert(partial[batch][h] == 0.0f);
-    }
-}
-
 template <bool quantized>
 void testTiedEmbedding() {
     const NnUint vocab = 5u;
     const NnUint hiddenSize = 32u;
     const NnUint physicalSize = 40u;
+    const NnUint tileSize = 2u;
+    const NnUint tileCount = (vocab + tileSize - 1u) / tileSize;
     const NnUint batches = 3u;
     const NnUint threads = 2u;
     const NnUint nodeIndex = 1u;
@@ -712,13 +645,19 @@ void testTiedEmbedding() {
     }
 
     float logits[batches][vocab];
+    float partials[batches][tileCount * physicalSize];
     float mix[batches][physicalSize];
     float maxima[batches * nNodes];
     std::fill(maxima, maxima + batches * nNodes, -123.0f);
     NnByte *logitRows[batches];
     NnByte *hiddenRows[batches];
+    NnByte *partialRows[batches];
+    NnByte *maximumRows[batches];
     for (NnUint batch = 0u; batch < batches; ++batch) {
         logitRows[batch] = reinterpret_cast<NnByte *>(logits[batch]);
+        partialRows[batch] = reinterpret_cast<NnByte *>(partials[batch]);
+        maximumRows[batch] = reinterpret_cast<NnByte *>(
+            &maxima[batch * nNodes + nodeIndex]);
         hiddenRows[batch] = quantized
             ? reinterpret_cast<NnByte *>(quantHidden.data() + batch * hiddenSize / Q80_BLOCK_SIZE)
             : reinterpret_cast<NnByte *>(hidden.data() + batch * hiddenSize);
@@ -727,16 +666,22 @@ void testTiedEmbedding() {
     for (NnUint thread = 0u; thread < threads; ++thread) {
         SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
         if (quantized) {
-            tiedEmbeddingLocal_Q80_Q40_F32(
-                logitRows, hiddenRows, quantEmbedding.data(), &mix[0][0], maxima,
-                vocab, hiddenSize, physicalSize, nodeIndex, nNodes,
-                1.0f / temperature, softcap, batchStart, batchEnd);
+            tiedEmbeddingPartial_Q80_Q40_F32(
+                logitRows, hiddenRows, quantEmbedding.data(), &partials[0][0],
+                vocab, hiddenSize, physicalSize, tileCount,
+                1.0f / temperature, softcap, batches, batchStart, batchEnd);
         } else {
-            tiedEmbeddingLocal_F32_F32_F32(
-                logitRows, hiddenRows, embedding.data(), &mix[0][0], maxima,
-                vocab, hiddenSize, physicalSize, nodeIndex, nNodes,
-                1.0f / temperature, softcap, batchStart, batchEnd);
+            tiedEmbeddingPartial_F32_F32_F32(
+                logitRows, hiddenRows, embedding.data(), &partials[0][0],
+                vocab, hiddenSize, physicalSize, tileCount,
+                1.0f / temperature, softcap, batches, batchStart, batchEnd);
         }
+    }
+    for (NnUint thread = 0u; thread < threads; ++thread) {
+        SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
+        tiedEmbeddingReduce_F32(
+            maximumRows, partialRows, &mix[0][0], hiddenSize, physicalSize, tileCount,
+            batchStart, batchEnd);
     }
 
     for (NnUint batch = 0u; batch < batches; ++batch) {
@@ -952,7 +897,6 @@ int main() {
     testShiftSlots();
     testTopk();
     testDiffusionAttention();
-    testEmbeddingMix();
     testTiedEmbedding<false>();
     testTiedEmbedding<true>();
     testPaddedShards();

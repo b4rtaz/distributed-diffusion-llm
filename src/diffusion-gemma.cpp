@@ -64,6 +64,7 @@ struct NodeBuilder {
     NnUint ropeSliding;
     NnUint ropeFull;
     NnUint globalVocabularyMax;
+    NnUint partialEmbeddingMix;
     NnUint localEmbeddingMix;
     NnUint globalEmbeddingMix;
 
@@ -107,6 +108,13 @@ struct NodeBuilder {
     }
 
     NnUint localVocab() const { return h.vocabSize / nNodes; }
+    NnUint tiedEmbeddingTileSize() const {
+#if defined(DLLAMA_VULKAN)
+        return std::min(localVocab(), NN_TIED_EMBEDDING_VULKAN_TILE_SIZE);
+#else
+        return localVocab();
+#endif
+    }
     NnPaddedShard denseShard() const { return paddedShard(h.denseIntermediateSize, nNodes, nodeIndex, 32u); }
     NnPaddedShard moeShard() const { return paddedShard(h.moeIntermediateSize, nNodes, nodeIndex, 32u); }
 
@@ -173,8 +181,12 @@ struct NodeBuilder {
         branchCombined = node.addBuffer("branch_combined", size2D(F_32, batches, h.hiddenSize));
         ropeSliding = node.addBuffer("rope_sliding", size2D(F_32, context, h.slidingHeadDim));
         ropeFull = node.addBuffer("rope_full", size2D(F_32, context, h.fullHeadDim));
-        const NnUint mixWidth = ((h.hiddenSize + 1u + 31u) / 32u) * 32u;
+        const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
+        const NnUint tileSize = tiedEmbeddingTileSize();
+        const NnUint tileCount = (localVocab() + tileSize - 1u) / tileSize;
         globalVocabularyMax = node.addBuffer("global_vocabulary_max", size2D(F_32, batches, 1u));
+        partialEmbeddingMix = node.addBuffer("partial_embedding_mix",
+            size2D(F_32, batches, tileCount * mixWidth));
         localEmbeddingMix = node.addBuffer("local_embedding_mix", size2D(F_32, batches, mixWidth));
         globalEmbeddingMix = node.addBuffer("global_embedding_mix", size2D(F_32, batches, mixWidth));
 
@@ -575,12 +587,7 @@ struct NodeBuilder {
     void addLogitsSegment(bool decoder) {
         NnSegmentConfigBuilder s;
         castForMatmul(s, x, quantHidden, decoder ? "decoder.quantize_logits" : "encoder.quantize_logits");
-#if defined(DLLAMA_VULKAN)
-        const bool useTiedEmbedding = false;
-#else
-        const bool useTiedEmbedding = decoder;
-#endif
-        if (useTiedEmbedding) {
+        if (decoder) {
             node.addSegment(s.build());
             return;
         }
@@ -601,20 +608,28 @@ struct NodeBuilder {
 
     void addVocabularyMaxSegment(bool decoder) {
         NnSegmentConfigBuilder maxima;
-#if !defined(DLLAMA_VULKAN)
         if (decoder) {
-            const NnUint mixWidth = ((h.hiddenSize + 1u + 31u) / 32u) * 32u;
+            const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
+            const NnUint tileSize = tiedEmbeddingTileSize();
+            const NnUint tileCount = (localVocab() + tileSize - 1u) / tileSize;
             maxima.addOp(OP_TIED_EMBEDDING, "token_embedding.weight", 0u,
                 pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
                 size2D(weightType, localVocab(), h.hiddenSize), embeddingWeight,
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL, localEmbeddingMix,
-                    pipes.vocabularyMaxSync, 0u, pipes.temperature, nodeIndex, nNodes, mixWidth,
-                    1.0f, h.logitSoftcap, 1u});
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_PARTIAL, 0u,
+                    0u, 0u, pipes.temperature, nodeIndex, nNodes, mixWidth,
+                    1.0f, h.logitSoftcap, 1u, partialEmbeddingMix,
+                    tileSize, tileCount, h.hiddenSize});
+            maxima.addOp(OP_TIED_EMBEDDING, "embedding_mix.reduce_tiles", 0u,
+                pointerBatchConfig(SRC_BUFFER, partialEmbeddingMix),
+                pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync), size0(),
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_REDUCE, localEmbeddingMix,
+                    pipes.vocabularyMaxSync, 0u, 0u, nodeIndex, nNodes, mixWidth,
+                    1.0f, 0.0f, 0u, partialEmbeddingMix,
+                    tileSize, tileCount, h.hiddenSize});
             maxima.addSync(pipes.vocabularyMaxSync, SYNC_NODE_SLICES);
             node.addSegment(maxima.build());
             return;
         }
-#endif
         maxima.addOp(OP_TIED_EMBEDDING, "embedding_mix.local_max", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync),
             size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_MAX, 0u, 0u,
@@ -624,27 +639,18 @@ struct NodeBuilder {
     }
 
     void addVocabularyStatsSegment(bool decoder) {
-        const NnUint mixWidth = ((h.hiddenSize + 1u + 31u) / 32u) * 32u;
+        const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
         NnSegmentConfigBuilder sum;
         sum.addOp(OP_TIED_EMBEDDING, "embedding_mix.global_max", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.vocabularyMaxSync), pointerBatchConfig(SRC_BUFFER, globalVocabularyMax),
             size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_GLOBAL_MAX, 0u, 0u,
                 0u, pipes.temperature, nodeIndex, nNodes, 0u, 1.0f, 0.0f, 0u});
         if (decoder) {
-#if defined(DLLAMA_VULKAN)
-            sum.addOp(OP_TIED_EMBEDDING, "token_embedding.weight", 0u,
-                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_BUFFER, localEmbeddingMix),
-                size2D(weightType, localVocab(), h.hiddenSize), embeddingWeight,
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_SUM, 0u, 0u,
-                    globalVocabularyMax, pipes.temperature, nodeIndex, nNodes, mixWidth,
-                    1.0f, 0.0f, 1u});
-#else
             sum.addOp(OP_TIED_EMBEDDING, "embedding_mix.rescale", 0u,
                 pointerBatchConfig(SRC_BUFFER, localEmbeddingMix), pointerBatchConfig(SRC_BUFFER, localEmbeddingMix),
                 size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_RESCALE, 0u,
                     pipes.vocabularyMaxSync, globalVocabularyMax, 0u, nodeIndex, nNodes, mixWidth,
                     1.0f, 0.0f, 0u});
-#endif
             sum.addOp(OP_CAST, "embedding_mix.pack", 0u,
                 pointerBatchConfig(SRC_BUFFER, localEmbeddingMix), pointerBatchedSliceConfig(SRC_PIPE, pipes.embeddingMixSync),
                 size0(), NnCastOpCodeConfig{});
@@ -661,22 +667,15 @@ struct NodeBuilder {
     }
 
     void addEmbeddingMixFinalizeSegment() {
-        const NnUint mixWidth = ((h.hiddenSize + 1u + 31u) / 32u) * 32u;
+        const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
         NnSegmentConfigBuilder finalize;
         finalize.addOp(OP_MERGE_SUM, "embedding_mix.reduce", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.embeddingMixSync), pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix),
             size0(), NnMergeSumOpCodeConfig{1u});
-#if defined(DLLAMA_VULKAN)
-        finalize.addOp(OP_TIED_EMBEDDING, "embedding_mix.finalize", 0u,
-            pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix), pointerBatchConfig(SRC_PIPE, pipes.selfConditioning),
-            size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_FINALIZE, 0u, 0u,
-                0u, pipes.temperature, nodeIndex, nNodes, mixWidth, h.embeddingScale, 0.0f, 0u});
-#else
         finalize.addOp(OP_TIED_EMBEDDING, "embedding_mix.finalize", 0u,
             pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix), pointerBatchConfig(SRC_PIPE, pipes.selfConditioning),
             size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_FINALIZE, 0u,
                 0u, 0u, 0u, nodeIndex, nNodes, mixWidth, h.embeddingScale, 0.0f, 0u});
-#endif
         finalize.addOp(OP_VOCAB_STATS, "sampler.sample", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.samplerStatsSync), pointerBatchedSliceConfig(SRC_PIPE, pipes.sampledTokensSync),
             size0(), NnVocabStatsOpConfig{VOCAB_STATS_SAMPLE, globalVocabularyMax, pipes.temperature,
@@ -745,7 +744,7 @@ DiffusionGemmaGraph buildDiffusionGemmaGraph(
     graph.pipes.feedForwardSync = net.addPipe("feed_forward_sync", size2D(transferType, maxBatchSize, nNodes * 2u * header.hiddenSize));
     graph.pipes.localLogits = net.addPipe("local_logits", size2D(F_32, maxBatchSize, header.vocabSize / nNodes));
     graph.pipes.vocabularyMaxSync = net.addPipe("vocabulary_max_sync", size2D(F_32, maxBatchSize, nNodes));
-    const NnUint mixWidth = ((header.hiddenSize + 1u + 31u) / 32u) * 32u;
+    const NnUint mixWidth = ((header.hiddenSize + 2u + 31u) / 32u) * 32u;
     graph.pipes.embeddingMixSync = net.addPipe("embedding_mix_sync", size2D(transferType, maxBatchSize, nNodes * mixWidth));
     graph.pipes.samplerStatsSync = net.addPipe("sampler_stats_sync", size2D(F_32, maxBatchSize,
         NN_VOCAB_MICROSHARDS * NN_VOCAB_STATS_WIDTH));
