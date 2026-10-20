@@ -967,45 +967,45 @@ static void tiedEmbeddingPartial_F32_F32_F32(
     }
 
     for (NnUint token = 0u; token < vocabSize; ++token) {
-            const float *row = embedding + token * hiddenSize;
-            for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-                const float *hidden = reinterpret_cast<const float *>(hiddenRows[batch]);
-                const float rawLogit = dotProduct_F32(hidden, row, hiddenSize);
-                const float logit = logitSoftcap * tanhf(rawLogit / logitSoftcap);
-                reinterpret_cast<float *>(logitRows[batch])[token] = logit;
-                const float score = logit * inverseTemperature;
-                if (token == 0u) {
-                    runningMax[batch] = score;
-                    denominator[batch] = 1.0f;
-                    outputScale[batch] = 0.0f;
-                    valueScale[batch] = 1.0f;
-                } else if (score > runningMax[batch]) {
-                    const float scale = expf(runningMax[batch] - score);
-                    runningMax[batch] = score;
-                    denominator[batch] = denominator[batch] * scale + 1.0f;
-                    outputScale[batch] = scale;
-                    valueScale[batch] = 1.0f;
-                } else {
-                    const float scale = expf(score - runningMax[batch]);
-                    denominator[batch] += scale;
-                    outputScale[batch] = 1.0f;
-                    valueScale[batch] = scale;
-                }
+        const float *row = embedding + token * hiddenSize;
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            const float *hidden = reinterpret_cast<const float *>(hiddenRows[batch]);
+            const float rawLogit = dotProduct_F32(hidden, row, hiddenSize);
+            const float logit = logitSoftcap * tanhf(rawLogit / logitSoftcap);
+            reinterpret_cast<float *>(logitRows[batch])[token] = logit;
+            const float score = logit * inverseTemperature;
+            if (token == 0u) {
+                runningMax[batch] = score;
+                denominator[batch] = 1.0f;
+                outputScale[batch] = 0.0f;
+                valueScale[batch] = 1.0f;
+            } else if (score > runningMax[batch]) {
+                const float scale = expf(runningMax[batch] - score);
+                runningMax[batch] = score;
+                denominator[batch] = denominator[batch] * scale + 1.0f;
+                outputScale[batch] = scale;
+                valueScale[batch] = 1.0f;
+            } else {
+                const float scale = expf(score - runningMax[batch]);
+                denominator[batch] += scale;
+                outputScale[batch] = 1.0f;
+                valueScale[batch] = scale;
             }
-            for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-                weightedAccumulate_F32(
-                    partials + batch * tileCount * physicalSize,
-                    row,
-                    hiddenSize,
-                    outputScale[batch],
-                    valueScale[batch]);
-            }
+        }
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            weightedAccumulate_F32(
+                partials + batch * tileCount * physicalSize,
+                row,
+                hiddenSize,
+                outputScale[batch],
+                valueScale[batch]);
+        }
     }
 
     for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-            float *partial = partials + batch * tileCount * physicalSize;
-            partial[hiddenSize] = denominator[batch];
-            partial[hiddenSize + 1u] = runningMax[batch];
+        float *partial = partials + batch * tileCount * physicalSize;
+        partial[hiddenSize] = denominator[batch];
+        partial[hiddenSize + 1u] = runningMax[batch];
     }
 }
 
@@ -1043,55 +1043,55 @@ static void tiedEmbeddingPartial_Q80_Q40_F32(
     }
 
     for (NnUint token = 0u; token < vocabSize; ++token) {
-            const NnBlockQ40 *quantizedRow = embedding + token * rowBlocks;
-            for (NnUint block = 0u; block < rowBlocks; ++block)
-                dequantizeQ40Block_F32(
-                    &quantizedRow[block], row.data() + block * Q40_BLOCK_SIZE);
-            for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-                float rawLogit;
-                matmul_Q80_Q40_F32(
-                    &rawLogit,
-                    reinterpret_cast<const NnBlockQ80 *>(hiddenRows[batch]),
-                    quantizedRow,
-                    hiddenSize,
-                    1u,
-                    1u,
-                    0u);
-                const float logit = logitSoftcap * tanhf(rawLogit / logitSoftcap);
-                reinterpret_cast<float *>(logitRows[batch])[token] = logit;
-                const float score = logit * inverseTemperature;
-                if (token == 0u) {
-                    runningMax[batch] = score;
-                    denominator[batch] = 1.0f;
-                    outputScale[batch] = 0.0f;
-                    valueScale[batch] = 1.0f;
-                } else if (score > runningMax[batch]) {
-                    const float scale = expf(runningMax[batch] - score);
-                    runningMax[batch] = score;
-                    denominator[batch] = denominator[batch] * scale + 1.0f;
-                    outputScale[batch] = scale;
-                    valueScale[batch] = 1.0f;
-                } else {
-                    const float scale = expf(score - runningMax[batch]);
-                    denominator[batch] += scale;
-                    outputScale[batch] = 1.0f;
-                    valueScale[batch] = scale;
-                }
+        const NnBlockQ40 *quantizedRow = embedding + token * rowBlocks;
+        for (NnUint block = 0u; block < rowBlocks; ++block)
+            dequantizeQ40Block_F32(
+                &quantizedRow[block], row.data() + block * Q40_BLOCK_SIZE);
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            float rawLogit;
+            matmul_Q80_Q40_F32(
+                &rawLogit,
+                reinterpret_cast<const NnBlockQ80 *>(hiddenRows[batch]),
+                quantizedRow,
+                hiddenSize,
+                1u,
+                1u,
+                0u);
+            const float logit = logitSoftcap * tanhf(rawLogit / logitSoftcap);
+            reinterpret_cast<float *>(logitRows[batch])[token] = logit;
+            const float score = logit * inverseTemperature;
+            if (token == 0u) {
+                runningMax[batch] = score;
+                denominator[batch] = 1.0f;
+                outputScale[batch] = 0.0f;
+                valueScale[batch] = 1.0f;
+            } else if (score > runningMax[batch]) {
+                const float scale = expf(runningMax[batch] - score);
+                runningMax[batch] = score;
+                denominator[batch] = denominator[batch] * scale + 1.0f;
+                outputScale[batch] = scale;
+                valueScale[batch] = 1.0f;
+            } else {
+                const float scale = expf(score - runningMax[batch]);
+                denominator[batch] += scale;
+                outputScale[batch] = 1.0f;
+                valueScale[batch] = scale;
             }
-            for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-                weightedAccumulate_F32(
-                    partials + batch * tileCount * physicalSize,
-                    row.data(),
-                    hiddenSize,
-                    outputScale[batch],
-                    valueScale[batch]);
-            }
+        }
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            weightedAccumulate_F32(
+                partials + batch * tileCount * physicalSize,
+                row.data(),
+                hiddenSize,
+                outputScale[batch],
+                valueScale[batch]);
+        }
     }
 
     for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-            float *partial = partials + batch * tileCount * physicalSize;
-            partial[hiddenSize] = denominator[batch];
-            partial[hiddenSize + 1u] = runningMax[batch];
+        float *partial = partials + batch * tileCount * physicalSize;
+        partial[hiddenSize] = denominator[batch];
+        partial[hiddenSize + 1u] = runningMax[batch];
     }
 }
 
