@@ -1,5 +1,6 @@
 #include "nn-cpu-ops.cpp"
 #include <vector>
+#include <thread>
 
 // framework
 
@@ -608,18 +609,14 @@ void testDiffusionAttention() {
     compare_F32("diffusionAttentionNoPrefix", actual, expected, queryLength * qHeads * headDim, 0.00001f);
 }
 
-template <bool quantized>
-void testTiedEmbedding() {
-    const NnUint vocab = 5u;
-    const NnUint hiddenSize = 32u;
-    const NnUint physicalSize = 40u;
+template <bool quantized, NnUint vocab = 5u, NnUint hiddenSize = 32u,
+    NnUint batches = 3u, NnUint threads = 2u>
+void testTiedEmbedding(float temperature = 0.7f) {
+    const NnUint physicalSize = hiddenSize + 8u;
     const NnUint tileSize = 2u;
     const NnUint tileCount = (vocab + tileSize - 1u) / tileSize;
-    const NnUint batches = 3u;
-    const NnUint threads = 2u;
     const NnUint nodeIndex = 1u;
     const NnUint nNodes = 2u;
-    const float temperature = 0.7f;
     const float softcap = 2.5f;
 
     std::vector<float> hidden(batches * hiddenSize);
@@ -663,20 +660,26 @@ void testTiedEmbedding() {
             : reinterpret_cast<NnByte *>(hidden.data() + batch * hiddenSize);
     }
 
-    for (NnUint thread = 0u; thread < threads; ++thread) {
+    auto work = [&](NnUint thread) {
         SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
         if (quantized) {
             tiedEmbeddingPartial_Q80_Q40_F32(
                 logitRows, hiddenRows, quantEmbedding.data(), &partials[0][0],
                 vocab, hiddenSize, physicalSize, tileCount,
-                1.0f / temperature, softcap, batches, batchStart, batchEnd);
+                1.0f / temperature, softcap, batchStart, batchEnd);
         } else {
             tiedEmbeddingPartial_F32_F32_F32(
                 logitRows, hiddenRows, embedding.data(), &partials[0][0],
                 vocab, hiddenSize, physicalSize, tileCount,
                 1.0f / temperature, softcap, batches, batchStart, batchEnd);
         }
-    }
+    };
+    std::vector<std::thread> workers;
+    for (NnUint thread = 1u; thread < threads; ++thread)
+        workers.emplace_back(work, thread);
+    work(0u);
+    for (auto &worker : workers)
+        worker.join();
     for (NnUint thread = 0u; thread < threads; ++thread) {
         SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
         tiedEmbeddingReduce_F32(
@@ -698,7 +701,8 @@ void testTiedEmbedding() {
         compare_F32(quantized ? "tiedEmbeddingLogitsQ40" : "tiedEmbeddingLogitsF32",
             logits[batch], expectedLogits, vocab, 0.00001f);
         compare_F32(quantized ? "tiedEmbeddingMaxQ40" : "tiedEmbeddingMaxF32",
-            &maxima[batch * nNodes + nodeIndex], &maximum, 1u, 0.00001f);
+            &maxima[batch * nNodes + nodeIndex], &maximum, 1u,
+            0.00001f + std::fabs(maximum) * 0.000001f);
 
         float probabilities[vocab];
         float denominator = 0.0f;
@@ -899,6 +903,12 @@ int main() {
     testDiffusionAttention();
     testTiedEmbedding<false>();
     testTiedEmbedding<true>();
+    // Multiple panels, a one-token tail, odd Q40 block count, and an uneven
+    // thread split that exercises batched GEMM and its small-batch fallback.
+    testTiedEmbedding<true, 257u, 96u, 13u, 3u>();
+    testTiedEmbedding<true, 128u, 64u, 8u, 2u>();
+    testTiedEmbedding<true, 257u, 96u, 13u, 3u>(0.001f);
+    testTiedEmbedding<true, 5u, 32u, 3u, 8u>();
     testPaddedShards();
     testProportionalRope();
     testScaledShardedEmbedding();

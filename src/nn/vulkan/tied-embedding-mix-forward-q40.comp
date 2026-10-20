@@ -1,0 +1,55 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "tied-embedding-q40.glsl"
+
+// Eight canvas rows by 32 hidden columns. Q40 blocks are decoded once into
+// shared memory for each 32-token panel and reused by all eight canvas rows.
+layout(local_size_x = 128) in;
+shared float weights[32][33];
+shared float probs[8][32];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint h = lane % 32u;
+    const uint b = lane / 32u;
+    const uint blockCount = HIDDEN_SIZE / 32u;
+    const uint tile = gl_WorkGroupID.x / blockCount;
+    const uint block = gl_WorkGroupID.x % blockCount;
+    const uint batch = gl_WorkGroupID.y * 8u;
+    const uint tokenStart = tile * tileSize;
+    const uint tokenEnd = min(tokenStart + tileSize, infos[batch].outputSizeX);
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (uint start = tokenStart; start < tokenEnd; start += 32u) {
+        const uint token = start + h;
+        // Each of four lanes decodes eight values from a vocabulary row.
+        if (token < tokenEnd) {
+            const BlockQ40 w = embedding[token * blockCount + block];
+            const float scale = float(w.d);
+            for (uint i = b * 4u; i < b * 4u + 4u; ++i) {
+                const uint packed = w.qs[i];
+                weights[i][h] = scale * float(int(packed & 15u) - 8);
+                weights[i + 16u][h] = scale * float(int(packed >> 4u) - 8);
+            }
+        } else {
+            for (uint i = b * 4u; i < b * 4u + 4u; ++i) {
+                weights[i][h] = 0.0f;
+                weights[i + 16u][h] = 0.0f;
+            }
+        }
+        probs[b][h] = token < tokenEnd && batch + b < batchSize
+            ? probabilities[infos[batch + b].outputOffset + token] : 0.0f;
+        probs[b + 4u][h] = token < tokenEnd && batch + b + 4u < batchSize
+            ? probabilities[infos[batch + b + 4u].outputOffset + token] : 0.0f;
+        barrier();
+        for (uint k = 0u; k < 32u; ++k) {
+            const float w = weights[h][k];
+            sum0 += probs[b][k] * w;
+            sum1 += probs[b + 4u][k] * w;
+        }
+        barrier();
+    }
+    if (batch + b < batchSize)
+        partials[((batch + b) * tileCount + tile) * physicalSize + block * 32u + h] = sum0;
+    if (batch + b + 4u < batchSize)
+        partials[((batch + b + 4u) * tileCount + tile) * physicalSize + block * 32u + h] = sum1;
+}

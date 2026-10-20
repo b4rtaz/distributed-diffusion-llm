@@ -1,0 +1,49 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "tied-embedding-q40.glsl"
+
+layout(local_size_x = 128) in;
+shared float values[128];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint tile = gl_WorkGroupID.x;
+    const uint batch = gl_WorkGroupID.y;
+    const BatchInfo info = infos[batch];
+    const uint start = tile * tileSize;
+    const uint end = min(start + tileSize, info.outputSizeX);
+    const float inverseTemperature = 1.0f / temperature[0];
+    float maximum = -3.402823466e+38f;
+    for (uint t = start + lane; t < end; t += 128u)
+        maximum = max(maximum, logits[info.outputOffset + t] * inverseTemperature);
+    values[lane] = maximum;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            values[lane] = max(values[lane], values[lane + stride]);
+        barrier();
+    }
+    maximum = values[0];
+    // Every lane must read the maximum before values[] is reused for sums.
+    barrier();
+    float denominator = 0.0f;
+    for (uint t = start + lane; t < end; t += 128u) {
+        const float probability = exp(logits[info.outputOffset + t] * inverseTemperature - maximum);
+        probabilities[info.outputOffset + t] = probability;
+        denominator += probability;
+    }
+    values[lane] = denominator;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            values[lane] += values[lane + stride];
+        barrier();
+    }
+    const uint offset = (batch * tileCount + tile) * physicalSize;
+    if (lane == 0u) {
+        partials[offset + HIDDEN_SIZE] = values[0];
+        partials[offset + HIDDEN_SIZE + 1u] = maximum;
+    }
+    for (uint h = HIDDEN_SIZE + 2u + lane; h < physicalSize; h += 128u)
+        partials[offset + h] = 0.0f;
+}

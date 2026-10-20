@@ -1009,6 +1009,50 @@ static void tiedEmbeddingPartial_F32_F32_F32(
     }
 }
 
+static void packTiedEmbeddingPanel_Q40(
+    const NnBlockQ40 *weights, float *transposed,
+    NnUint rowBlocks, NnUint length, NnUint panelSize)
+{
+    for (NnUint block = 0u; block < rowBlocks; ++block) {
+        for (NnUint t = 0u; t < panelSize; t += 4u) {
+            float rows[4][Q40_BLOCK_SIZE];
+            for (NnUint r = 0u; r < 4u; ++r) {
+                if (t + r < length)
+                    dequantizeQ40Block_F32(&weights[(t + r) * rowBlocks + block], rows[r]);
+                else
+                    std::fill(rows[r], rows[r] + Q40_BLOCK_SIZE, 0.0f);
+            }
+            for (NnUint h = 0u; h < Q40_BLOCK_SIZE; h += 4u) {
+                float *out = transposed + (block * Q40_BLOCK_SIZE + h) * panelSize + t;
+#if defined(__ARM_NEON)
+                const float32x4x2_t a = vtrnq_f32(vld1q_f32(rows[0] + h), vld1q_f32(rows[1] + h));
+                const float32x4x2_t b = vtrnq_f32(vld1q_f32(rows[2] + h), vld1q_f32(rows[3] + h));
+                vst1q_f32(out, vcombine_f32(vget_low_f32(a.val[0]), vget_low_f32(b.val[0])));
+                vst1q_f32(out + panelSize, vcombine_f32(vget_low_f32(a.val[1]), vget_low_f32(b.val[1])));
+                vst1q_f32(out + panelSize * 2u, vcombine_f32(vget_high_f32(a.val[0]), vget_high_f32(b.val[0])));
+                vst1q_f32(out + panelSize * 3u, vcombine_f32(vget_high_f32(a.val[1]), vget_high_f32(b.val[1])));
+#elif defined(__AVX2__)
+                __m128 a = _mm_loadu_ps(rows[0] + h), b = _mm_loadu_ps(rows[1] + h);
+                __m128 c = _mm_loadu_ps(rows[2] + h), d = _mm_loadu_ps(rows[3] + h);
+                _MM_TRANSPOSE4_PS(a, b, c, d);
+                _mm_storeu_ps(out, a);
+                _mm_storeu_ps(out + panelSize, b);
+                _mm_storeu_ps(out + panelSize * 2u, c);
+                _mm_storeu_ps(out + panelSize * 3u, d);
+#else
+                for (NnUint c = 0u; c < 4u; ++c)
+                    for (NnUint r = 0u; r < 4u; ++r)
+                        out[c * panelSize + r] = rows[r][h + c];
+#endif
+            }
+        }
+    }
+}
+
+// Keep the two matrix products in cache-sized vocabulary panels. The original
+// online, one-token-at-a-time path cannot reuse the GEMM register tiles across
+// canvas positions. Only this small decoded panel is transposed, never the
+// shared embedding tensor. Thread ownership is still by batch, with no barriers.
 static void tiedEmbeddingPartial_Q80_Q40_F32(
     NnByte **logitRows,
     NnByte **hiddenRows,
@@ -1020,78 +1064,82 @@ static void tiedEmbeddingPartial_Q80_Q40_F32(
     const NnUint tileCount,
     const float inverseTemperature,
     const float logitSoftcap,
-    const NnUint batchSize,
     const NnUint batchStart,
     const NnUint batchEnd)
 {
-    if (batchStart == batchEnd)
+    const NnUint count = batchEnd - batchStart;
+    if (count == 0u)
         return;
+    const NnUint panelSize = 128u;
     const NnUint rowBlocks = hiddenSize / Q40_BLOCK_SIZE;
-    std::vector<float> row(hiddenSize);
-    std::vector<float> runningMax(batchSize);
-    std::vector<float> denominator(batchSize);
-    std::vector<float> outputScale(batchSize);
-    std::vector<float> valueScale(batchSize);
-
-    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-        float *partial = partials + batch * tileCount * physicalSize;
+    std::vector<NnBlockQ80> hidden(count * rowBlocks);
+    std::vector<float> scores(count * panelSize);
+    std::vector<float> transposed(hiddenSize * panelSize);
+    std::vector<float> numerator(count * hiddenSize);
+    std::vector<float> maxima(count, -INFINITY);
+    std::vector<float> denominators(count, 0.0f);
+    for (NnUint b = 0u; b < count; ++b) {
+        std::memcpy(hidden.data() + b * rowBlocks, hiddenRows[batchStart + b],
+            rowBlocks * sizeof(NnBlockQ80));
+        float *partial = partials + (batchStart + b) * tileCount * physicalSize;
         std::fill(partial, partial + physicalSize, 0.0f);
         for (NnUint tile = 1u; tile < tileCount; ++tile) {
             partial[tile * physicalSize + hiddenSize] = 0.0f;
             partial[tile * physicalSize + hiddenSize + 1u] = -INFINITY;
         }
     }
-
-    for (NnUint token = 0u; token < vocabSize; ++token) {
-        const NnBlockQ40 *quantizedRow = embedding + token * rowBlocks;
-        for (NnUint block = 0u; block < rowBlocks; ++block)
-            dequantizeQ40Block_F32(
-                &quantizedRow[block], row.data() + block * Q40_BLOCK_SIZE);
-        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-            float rawLogit;
-            matmul_Q80_Q40_F32(
-                &rawLogit,
-                reinterpret_cast<const NnBlockQ80 *>(hiddenRows[batch]),
-                quantizedRow,
-                hiddenSize,
-                1u,
-                1u,
-                0u);
-            const float logit = logitSoftcap * tanhf(rawLogit / logitSoftcap);
-            reinterpret_cast<float *>(logitRows[batch])[token] = logit;
-            const float score = logit * inverseTemperature;
-            if (token == 0u) {
-                runningMax[batch] = score;
-                denominator[batch] = 1.0f;
-                outputScale[batch] = 0.0f;
-                valueScale[batch] = 1.0f;
-            } else if (score > runningMax[batch]) {
-                const float scale = expf(runningMax[batch] - score);
-                runningMax[batch] = score;
-                denominator[batch] = denominator[batch] * scale + 1.0f;
-                outputScale[batch] = scale;
-                valueScale[batch] = 1.0f;
-            } else {
-                const float scale = expf(score - runningMax[batch]);
-                denominator[batch] += scale;
-                outputScale[batch] = 1.0f;
-                valueScale[batch] = scale;
+    for (NnUint start = 0u; start < vocabSize; start += panelSize) {
+        const NnUint length = std::min(panelSize, vocabSize - start);
+        const NnBlockQ40 *weights = embedding + start * rowBlocks;
+        if (!llamafile_sgemm(length, count, rowBlocks, weights, rowBlocks,
+                hidden.data(), rowBlocks, scores.data(), panelSize,
+                0, 1, 0, F_Q40, F_Q80, F_32)) {
+            for (NnUint b = 0u; b < count; ++b)
+                matmul_Q80_Q40_F32(scores.data() + b * panelSize,
+                    hidden.data() + b * rowBlocks, weights, hiddenSize, length, 1u, 0u);
+        }
+        for (NnUint b = 0u; b < count; ++b) {
+            float *probabilities = scores.data() + b * panelSize;
+            float *logits = reinterpret_cast<float *>(logitRows[batchStart + b]);
+            float maximum = maxima[b];
+            for (NnUint t = 0u; t < length; ++t) {
+                const float logit = logitSoftcap * tanhf(probabilities[t] / logitSoftcap);
+                logits[start + t] = logit;
+                probabilities[t] = logit * inverseTemperature;
+                maximum = std::max(maximum, probabilities[t]);
             }
+            const float scale = expf(maxima[b] - maximum);
+            float *partial = partials + (batchStart + b) * tileCount * physicalSize;
+            for (NnUint h = 0u; h < hiddenSize; ++h)
+                partial[h] *= scale;
+            denominators[b] *= scale;
+            maxima[b] = maximum;
+            float denominator = 0.0f;
+            for (NnUint t = 0u; t < length; ++t) {
+                probabilities[t] = expf(probabilities[t] - maximum);
+                denominator += probabilities[t];
+            }
+            denominators[b] += denominator;
+            std::fill(probabilities + length, probabilities + panelSize, 0.0f);
         }
-        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+        packTiedEmbeddingPanel_Q40(weights, transposed.data(), rowBlocks, length, panelSize);
+        if (!llamafile_sgemm(hiddenSize, count, panelSize,
+                transposed.data(), panelSize, scores.data(), panelSize,
+                numerator.data(), hiddenSize, 0, 1, 0, F_32, F_32, F_32)) {
+            for (NnUint b = 0u; b < count; ++b)
+                matmul_F32_F32_F32(numerator.data() + b * hiddenSize,
+                    scores.data() + b * panelSize, transposed.data(),
+                    panelSize, hiddenSize, 1u, 0u);
+        }
+        for (NnUint b = 0u; b < count; ++b)
             weightedAccumulate_F32(
-                partials + batch * tileCount * physicalSize,
-                row.data(),
-                hiddenSize,
-                outputScale[batch],
-                valueScale[batch]);
-        }
+                partials + (batchStart + b) * tileCount * physicalSize,
+                numerator.data() + b * hiddenSize, hiddenSize, 1.0f, 1.0f);
     }
-
-    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
-        float *partial = partials + batch * tileCount * physicalSize;
-        partial[hiddenSize] = denominator[batch];
-        partial[hiddenSize + 1u] = runningMax[batch];
+    for (NnUint b = 0u; b < count; ++b) {
+        float *partial = partials + (batchStart + b) * tileCount * physicalSize;
+        partial[hiddenSize] = denominators[b];
+        partial[hiddenSize + 1u] = maxima[b];
     }
 }
 
@@ -2049,7 +2097,6 @@ static void tiedEmbeddingPartialForward_Q80_Q40_F32(
         config->tileCount,
         1.0f / temperature,
         config->logitSoftcap,
-        batchSize,
         batchStart,
         batchEnd);
 }
