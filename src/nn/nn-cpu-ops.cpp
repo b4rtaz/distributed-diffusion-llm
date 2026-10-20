@@ -2250,6 +2250,14 @@ static void initVocabStatsForward(NnCpuOpContext *context) {
     }
 }
 
+static double shiftedVocabLogit(float logit, float inverseTemperature, float scaledMaximum) {
+    // Match the F32 multiplication used by tied-embedding maxima before
+    // widening for accumulation. Double division would give the maximum a
+    // nonzero shifted score and can make near-zero entropy negative.
+    const float scaledLogit = logit * inverseTemperature;
+    return static_cast<double>(scaledLogit) - scaledMaximum;
+}
+
 static void vocabStatsForward(
     NnUint nThreads,
     NnUint threadIndex,
@@ -2261,12 +2269,12 @@ static void vocabStatsForward(
     const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
     if (!(temperature > 0.0f) || !std::isfinite(temperature))
         throw std::runtime_error("VOCAB_STATS temperature must be finite and positive");
+    const float inverseTemperature = 1.0f / temperature;
     for (NnUint batchIndex = 0u; batchIndex < batchSize; ++batchIndex) {
         const float *input = (const float *)context->input[batchIndex];
         float *output = (float *)context->output[batchIndex];
         if (config->mode == VOCAB_STATS_LOCAL) {
             const float globalMax = ((const float *)context->buffers[config->globalMaxBufferIndex])[batchIndex];
-            const float scaledMax = globalMax;
             const NnUint microshardSize = context->inputSize.x / config->microshardCount;
             for (NnUint localShard = 0u; localShard < config->microshardCount; ++localShard) {
                 double denominator = 0.0;
@@ -2283,7 +2291,7 @@ static void vocabStatsForward(
                         localMax = logit;
                         argmax = token;
                     }
-                    const double shifted = (double)logit / temperature - scaledMax;
+                    const double shifted = shiftedVocabLogit(logit, inverseTemperature, globalMax);
                     const double weight = std::exp(shifted);
                     denominator += weight;
                     moment += weight * shifted;
@@ -2336,7 +2344,6 @@ static void vocabStatsForward(
             const float *logits = (const float *)context->pipes[config->localLogitsPipeIndex] +
                 (NnSize)batchIndex * logitsSize.x;
             const float globalMax = ((const float *)context->buffers[config->globalMaxBufferIndex])[batchIndex];
-            const double scaledGlobalMax = globalMax;
             const double localTarget = target - preceding;
             double cumulative = 0.0;
             const NnUint microshardSize = logitsSize.x / config->microshardCount;
@@ -2345,7 +2352,7 @@ static void vocabStatsForward(
             const NnUint end = start + microshardSize;
             NnUint sampled = end - 1u;
             for (NnUint token = start; token < end; ++token) {
-                cumulative += std::exp((double)logits[token] / temperature - scaledGlobalMax);
+                cumulative += std::exp(shiftedVocabLogit(logits[token], inverseTemperature, globalMax));
                 if (localTarget < cumulative) {
                     sampled = token;
                     break;

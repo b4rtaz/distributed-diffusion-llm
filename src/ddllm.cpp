@@ -213,7 +213,7 @@ void inference(DiffusionGemmaAppContext *context) {
     context->tokenizer->resetDecoder();
     const GenerationMetrics metrics = generate(context, &position, context->args->steps - position, 0u,
         [context](std::int32_t token) {
-            const std::string piece = context->tokenizer->decodeToken(token, true);
+            const std::string piece = context->tokenizer->decodeToken(token, false);
             if (!piece.empty()) { std::fwrite(piece.data(), 1u, piece.size(), stdout); std::fflush(stdout); }
         });
     const std::string tail = context->tokenizer->flushDecoder();
