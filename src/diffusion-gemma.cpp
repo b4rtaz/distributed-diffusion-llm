@@ -612,28 +612,23 @@ struct NodeBuilder {
             const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
             const NnUint tileSize = tiedEmbeddingTileSize();
             const NnUint tileCount = (localVocab() + tileSize - 1u) / tileSize;
-            maxima.addOp(OP_TIED_EMBEDDING, "token_embedding.weight", 0u,
+            maxima.addOp(OP_TIED_EMBEDDING_PARTIAL, "token_embedding.weight", 0u,
                 pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
                 size2D(weightType, localVocab(), h.hiddenSize), embeddingWeight,
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_PARTIAL, 0u,
-                    0u, 0u, pipes.temperature, nodeIndex, nNodes, mixWidth,
-                    1.0f, h.logitSoftcap, 1u, partialEmbeddingMix,
-                    tileSize, tileCount, h.hiddenSize});
-            maxima.addOp(OP_TIED_EMBEDDING, "embedding_mix.reduce_tiles", 0u,
+                NnTiedEmbeddingPartialOpConfig{pipes.temperature, partialEmbeddingMix,
+                    mixWidth, tileSize, tileCount, h.hiddenSize, h.logitSoftcap});
+            maxima.addOp(OP_TIED_EMBEDDING_REDUCE, "embedding_mix.reduce_tiles", 0u,
                 pointerBatchConfig(SRC_BUFFER, partialEmbeddingMix),
                 pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync), size0(),
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_REDUCE, localEmbeddingMix,
-                    pipes.vocabularyMaxSync, 0u, 0u, nodeIndex, nNodes, mixWidth,
-                    1.0f, 0.0f, 0u, partialEmbeddingMix,
-                    tileSize, tileCount, h.hiddenSize});
+                NnTiedEmbeddingReduceOpConfig{localEmbeddingMix, mixWidth,
+                    tileCount, h.hiddenSize});
             maxima.addSync(pipes.vocabularyMaxSync, SYNC_NODE_SLICES);
             node.addSegment(maxima.build());
             return;
         }
-        maxima.addOp(OP_TIED_EMBEDDING, "embedding_mix.local_max", 0u,
+        maxima.addOp(OP_REDUCE_MAX, "embedding_mix.local_max", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync),
-            size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_MAX, 0u, 0u,
-                0u, pipes.temperature, nodeIndex, nNodes, 0u, 1.0f, 0.0f, 1u});
+            size0(), NnReduceMaxOpConfig{pipes.temperature, 1u});
         maxima.addSync(pipes.vocabularyMaxSync, SYNC_NODE_SLICES);
         node.addSegment(maxima.build());
     }
@@ -641,16 +636,14 @@ struct NodeBuilder {
     void addVocabularyStatsSegment(bool decoder) {
         const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
         NnSegmentConfigBuilder sum;
-        sum.addOp(OP_TIED_EMBEDDING, "embedding_mix.global_max", 0u,
+        sum.addOp(OP_REDUCE_MAX, "embedding_mix.global_max", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.vocabularyMaxSync), pointerBatchConfig(SRC_BUFFER, globalVocabularyMax),
-            size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_GLOBAL_MAX, 0u, 0u,
-                0u, pipes.temperature, nodeIndex, nNodes, 0u, 1.0f, 0.0f, 0u});
+            size0(), NnReduceMaxOpConfig{pipes.temperature, 0u});
         if (decoder) {
-            sum.addOp(OP_TIED_EMBEDDING, "embedding_mix.rescale", 0u,
+            sum.addOp(OP_EMBEDDING_MIX_RESCALE, "embedding_mix.rescale", 0u,
                 pointerBatchConfig(SRC_BUFFER, localEmbeddingMix), pointerBatchConfig(SRC_BUFFER, localEmbeddingMix),
-                size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_RESCALE, 0u,
-                    pipes.vocabularyMaxSync, globalVocabularyMax, 0u, nodeIndex, nNodes, mixWidth,
-                    1.0f, 0.0f, 0u});
+                size0(), NnEmbeddingMixRescaleOpConfig{pipes.vocabularyMaxSync,
+                    globalVocabularyMax, nodeIndex, nNodes});
             sum.addOp(OP_CAST, "embedding_mix.pack", 0u,
                 pointerBatchConfig(SRC_BUFFER, localEmbeddingMix), pointerBatchedSliceConfig(SRC_PIPE, pipes.embeddingMixSync),
                 size0(), NnCastOpCodeConfig{});
@@ -672,10 +665,9 @@ struct NodeBuilder {
         finalize.addOp(OP_MERGE_SUM, "embedding_mix.reduce", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.embeddingMixSync), pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix),
             size0(), NnMergeSumOpCodeConfig{1u});
-        finalize.addOp(OP_TIED_EMBEDDING, "embedding_mix.finalize", 0u,
+        finalize.addOp(OP_EMBEDDING_MIX_FINALIZE, "embedding_mix.finalize", 0u,
             pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix), pointerBatchConfig(SRC_PIPE, pipes.selfConditioning),
-            size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_FINALIZE, 0u,
-                0u, 0u, 0u, nodeIndex, nNodes, mixWidth, h.embeddingScale, 0.0f, 0u});
+            size0(), NnEmbeddingMixFinalizeOpConfig{mixWidth, h.embeddingScale});
         finalize.addOp(OP_VOCAB_STATS, "sampler.sample", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.samplerStatsSync), pointerBatchedSliceConfig(SRC_PIPE, pipes.sampledTokensSync),
             size0(), NnVocabStatsOpConfig{VOCAB_STATS_SAMPLE, globalVocabularyMax, pipes.temperature,

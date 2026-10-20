@@ -96,9 +96,13 @@ enum NnOpCode {
     OP_SOFTMAX,
     OP_MOE_GATE,
     OP_DIFFUSION_ATTENTION,
-    OP_TIED_EMBEDDING,
+    OP_TIED_EMBEDDING_PARTIAL,
     OP_TANH,
     OP_VOCAB_STATS,
+    OP_TIED_EMBEDDING_REDUCE,
+    OP_REDUCE_MAX,
+    OP_EMBEDDING_MIX_RESCALE,
+    OP_EMBEDDING_MIX_FINALIZE,
     OP_COUNT,
 };
 
@@ -348,32 +352,39 @@ typedef struct {
     NnUint valueCacheBufferIndex;
 } NnDiffusionAttentionOpConfig;
 
-enum NnTiedEmbeddingMode {
-    TIED_EMBEDDING_RESCALE = 1,
-    TIED_EMBEDDING_FINALIZE = 2,
-    TIED_EMBEDDING_LOCAL_MAX = 3,
-    TIED_EMBEDDING_GLOBAL_MAX = 5,
-    TIED_EMBEDDING_PARTIAL = 6,
-    TIED_EMBEDDING_REDUCE = 7,
-};
-
 typedef struct {
-    NnTiedEmbeddingMode mode;
-    NnUint embeddingMixBufferIndex;
-    NnUint vocabularyMaxPipeIndex;
-    NnUint globalMaxBufferIndex;
     NnUint temperaturePipeIndex;
-    NnUint nodeIndex;
-    NnUint nNodes;
-    NnUint physicalSize;
-    float embeddingScale;
-    float logitSoftcap;
-    NnUint useTemperature;
     NnUint partialBufferIndex;
+    NnUint physicalSize;
     NnUint tileSize;
     NnUint tileCount;
     NnUint hiddenSize;
-} NnTiedEmbeddingOpConfig;
+    float logitSoftcap;
+} NnTiedEmbeddingPartialOpConfig;
+
+typedef struct {
+    NnUint embeddingMixBufferIndex;
+    NnUint physicalSize;
+    NnUint tileCount;
+    NnUint hiddenSize;
+} NnTiedEmbeddingReduceOpConfig;
+
+typedef struct {
+    NnUint divisorPipeIndex;
+    NnUint useDivisor;
+} NnReduceMaxOpConfig;
+
+typedef struct {
+    NnUint vocabularyMaxPipeIndex;
+    NnUint globalMaxBufferIndex;
+    NnUint nodeIndex;
+    NnUint nNodes;
+} NnEmbeddingMixRescaleOpConfig;
+
+typedef struct {
+    NnUint physicalSize;
+    float embeddingScale;
+} NnEmbeddingMixFinalizeOpConfig;
 
 #define NN_TIED_EMBEDDING_VULKAN_TILE_SIZE 8192u
 

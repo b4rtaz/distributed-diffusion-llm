@@ -642,7 +642,8 @@ void testGroupedMergeSum_F32() {
 #define EMBEDDING_MIX_HIDDEN 32
 #define EMBEDDING_MIX_PHYSICAL 64
 
-void testEmbeddingMixMax_F32_F32() {
+template <bool useDivisor>
+void testReduceMax_F32_F32() {
     execute(
         [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *, NnSegmentConfigBuilder *segmentBuilder) {
             const NnUint logitsPipeIndex = netBuilder->addPipe("logits",
@@ -650,11 +651,10 @@ void testEmbeddingMixMax_F32_F32() {
             const NnUint temperaturePipeIndex = netBuilder->addPipe("temperature", size1D(F_32, 1u));
             const NnUint maximumPipeIndex = netBuilder->addPipe("maximum", size2D(F_32, N_BATCHES, 1u));
             netBuilder->addPreSync(temperaturePipeIndex);
-            segmentBuilder->addOp(OP_TIED_EMBEDDING, "embedding_mix_max", 0u,
+            segmentBuilder->addOp(OP_REDUCE_MAX, "embedding_mix_max", 0u,
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 pointerBatchConfig(SRC_PIPE, maximumPipeIndex), size0(),
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_MAX, 0u, 0u, 0u,
-                    temperaturePipeIndex, 0u, 1u, 0u, 1.0f, 0.0f, 1u});
+                NnReduceMaxOpConfig{temperaturePipeIndex, useDivisor ? 1u : 0u});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *) {
             execution->setBatchSize(2u);
@@ -664,9 +664,50 @@ void testEmbeddingMixMax_F32_F32() {
             ((float *)execution->pipes[1])[0] = 2.0f;
             executor->forward();
             const float *maximum = (const float *)execution->pipes[2];
-            assertFloat(0u, maximum[0], 2.0f, 0.00001f);
+            assertFloat(0u, maximum[0], useDivisor ? 2.0f : 4.0f, 0.00001f);
             assertFloat(1u, maximum[1], 0.0f, 0.00001f);
-            printOk("testEmbeddingMixMax_F32");
+            printOk(useDivisor ? "testReduceMaxDivisor_F32" : "testReduceMax_F32");
+        });
+}
+
+void testEmbeddingMixRescale_F32_F32() {
+    constexpr NnUint width = 4u;
+    constexpr NnUint nNodes = 2u;
+    constexpr NnUint nodeIndex = 1u;
+    execute(
+        [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *nodeBuilder,
+            NnSegmentConfigBuilder *segmentBuilder) {
+            const NnUint localMaximumPipeIndex = netBuilder->addPipe("local_maximum",
+                size2D(F_32, N_BATCHES, nNodes));
+            netBuilder->addPreSync(localMaximumPipeIndex);
+            const NnUint mixBufferIndex = nodeBuilder->addBuffer("mix",
+                size2D(F_32, N_BATCHES, width));
+            const NnUint globalMaximumBufferIndex = nodeBuilder->addBuffer("global_maximum",
+                size2D(F_32, N_BATCHES, 1u));
+            segmentBuilder->addOp(OP_EMBEDDING_MIX_RESCALE, "embedding_mix_rescale", 0u,
+                pointerBatchConfig(SRC_BUFFER, mixBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, mixBufferIndex), size0(),
+                NnEmbeddingMixRescaleOpConfig{localMaximumPipeIndex,
+                    globalMaximumBufferIndex, nodeIndex, nNodes});
+        },
+        [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
+            constexpr NnUint batchSize = 2u;
+            execution->setBatchSize(batchSize);
+            const float localMaximum[] = {2.0f, 1.0f, -1.0f, 3.0f};
+            std::copy(localMaximum, localMaximum + batchSize * nNodes,
+                (float *)execution->pipes[0]);
+            const float input[N_BATCHES * width] = {
+                1.0f, 2.0f, 3.0f, 4.0f, -1.0f, -2.0f, -3.0f, -4.0f};
+            const float globalMaximum[N_BATCHES] = {2.0f, 4.0f};
+            device->writeBuffer(0u, (const NnByte *)input);
+            device->writeBuffer(1u, (const NnByte *)globalMaximum);
+            executor->forward();
+            float output[N_BATCHES * width];
+            device->readBuffer(0u, (NnByte *)output);
+            const float scale = expf(-1.0f);
+            for (NnUint i = 0u; i < batchSize * width; ++i)
+                assertFloat(i, output[i], input[i] * scale, 0.00001f);
+            printOk("testEmbeddingMixRescale_F32");
         });
 }
 
@@ -693,27 +734,22 @@ void testTiedEmbedding_F32() {
                 size2D(F_32, capacity, tileCount * physicalSize));
             const NnUint localMixBufferIndex = nodeBuilder->addBuffer("local_mix",
                 size2D(F_32, capacity, physicalSize));
-            segmentBuilder->addOp(OP_TIED_EMBEDDING, "tied_embedding_weight", 0u,
+            segmentBuilder->addOp(OP_TIED_EMBEDDING_PARTIAL, "tied_embedding_weight", 0u,
                 pointerBatchConfig(SRC_PIPE, hiddenPipeIndex),
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 size2D(quantized ? F_Q40 : F_32, vocabSize, hiddenSize),
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_PARTIAL, 0u, 0u, 0u,
-                    temperaturePipeIndex, 0u, 1u, physicalSize,
-                    1.0f, 2.5f, 1u, partialBufferIndex, tileSize, tileCount,
-                    hiddenSize});
-            segmentBuilder->addOp(OP_TIED_EMBEDDING, "tied_embedding_reduce", 0u,
+                NnTiedEmbeddingPartialOpConfig{temperaturePipeIndex,
+                    partialBufferIndex, physicalSize, tileSize, tileCount,
+                    hiddenSize, 2.5f});
+            segmentBuilder->addOp(OP_TIED_EMBEDDING_REDUCE, "tied_embedding_reduce", 0u,
                 pointerBatchConfig(SRC_BUFFER, partialBufferIndex),
                 pointerBatchConfig(SRC_PIPE, maximumPipeIndex), size0(),
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_REDUCE, localMixBufferIndex,
-                    maximumPipeIndex,
-                    0u, 0u, 0u, 1u, physicalSize,
-                    1.0f, 0.0f, 0u, partialBufferIndex, tileSize, tileCount,
-                    hiddenSize});
-            segmentBuilder->addOp(OP_TIED_EMBEDDING, "tied_embedding_finalize", 0u,
+                NnTiedEmbeddingReduceOpConfig{localMixBufferIndex, physicalSize,
+                    tileCount, hiddenSize});
+            segmentBuilder->addOp(OP_EMBEDDING_MIX_FINALIZE, "tied_embedding_finalize", 0u,
                 pointerBatchConfig(SRC_BUFFER, localMixBufferIndex),
                 pointerBatchConfig(SRC_PIPE, outputPipeIndex), size0(),
-                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_FINALIZE, 0u, 0u, 0u,
-                    0u, 0u, 1u, physicalSize, 2.0f, 0.0f, 0u});
+                NnEmbeddingMixFinalizeOpConfig{physicalSize, 2.0f});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *) {
             execution->setBatchSize(batchSize);
@@ -1879,7 +1915,9 @@ int main() {
     testShardedEmbedding_F32<false>();
     testShardedEmbedding_F32<true>();
 
-    testEmbeddingMixMax_F32_F32();
+    testReduceMax_F32_F32<false>();
+    testReduceMax_F32_F32<true>();
+    testEmbeddingMixRescale_F32_F32();
     testTiedEmbedding_F32<false>();
     testTiedEmbedding_F32<true>();
     testTiedEmbedding_F32<true, 257u, 96u, 128u, 9u, 9u>();

@@ -17,19 +17,10 @@ layout(binding = 0) readonly buffer inputBuffer { float x[]; };
 layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
 layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
 layout(binding = 3) readonly uniform configBuffer {
-    uint mode;
-    uint embeddingMixBufferIndex;
-    uint vocabularyMaxPipeIndex;
-    uint globalMaxBufferIndex;
-    uint temperaturePipeIndex;
-    uint nodeIndex;
-    uint nNodes;
-    uint physicalSize;
-    float embeddingScale;
-    float logitSoftcap;
-    uint useTemperature;
+    uint divisorPipeIndex;
+    uint useDivisor;
 };
-layout(binding = 4) readonly buffer temperatureBuffer { float temperature[]; };
+layout(binding = 4) readonly buffer divisorBuffer { float divisor[]; };
 
 shared float maxima[N_THREADS];
 
@@ -49,8 +40,8 @@ void main() {
         barrier();
     }
     if (threadIndex == 0u) {
-        const float scale = useTemperature != 0u
-            ? 1.0f / temperature[0]
+        const float scale = useDivisor != 0u
+            ? 1.0f / divisor[0]
             : 1.0f;
         y[info.outputOffset] = maxima[0] * scale;
     }

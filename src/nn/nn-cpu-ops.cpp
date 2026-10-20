@@ -1968,84 +1968,95 @@ static void diffusionAttentionForward_F32_F32(
         threadIndex);
 }
 
-static void initTiedEmbeddingReductionForward(NnCpuOpContext *context);
-static void tiedEmbeddingReductionForward(
-    NnUint nThreads,
-    NnUint threadIndex,
-    NnUint batchSize,
-    NnCpuOpContext *context);
+static void initTiedEmbeddingPartialForward(NnCpuOpContext *context) {
+    const NnTiedEmbeddingPartialOpConfig *config =
+        (NnTiedEmbeddingPartialOpConfig *)context->opConfig;
+    if (context->weightSize.floatType != F_32 && context->weightSize.floatType != F_Q40)
+        throw std::invalid_argument("TIED_EMBEDDING_PARTIAL supports F32 and Q40 embeddings");
+    if (context->inputSize.floatType != F_32 && context->inputSize.floatType != F_Q80)
+        throw std::invalid_argument("TIED_EMBEDDING_PARTIAL supports F32 and Q80 hidden states");
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    ASSERT_EQ(context->inputSize.x, context->weightSize.x);
+    ASSERT_EQ(context->outputSize.x, context->weightSize.y);
+    ASSERT_EQ(context->inputSize.y, context->nBatches);
+    ASSERT_EQ(context->outputSize.y, context->nBatches);
+    assert(config->tileSize > 0u && config->tileCount > 0u);
+    assert(config->tileCount == (context->weightSize.y + config->tileSize - 1u) / config->tileSize);
+    assert(config->physicalSize >= context->inputSize.x + 2u);
+    assert(config->logitSoftcap > 0.0f && std::isfinite(config->logitSoftcap));
+    const NnBufferConfig *partial = &context->bufferConfigs[config->partialBufferIndex];
+    ASSERT_EQ(partial->size.floatType, F_32);
+    ASSERT_EQ(partial->size.x, config->tileCount * config->physicalSize);
+    ASSERT_EQ(partial->size.y, context->nBatches);
+    const NnPipeConfig *temperature = &context->pipeConfigs[config->temperaturePipeIndex];
+    ASSERT_EQ(temperature->size.floatType, F_32);
+    assert(temperature->size.length == 1u);
+}
 
-static void initTiedEmbeddingForward(NnCpuOpContext *context) {
-    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
-    if (config->mode == TIED_EMBEDDING_LOCAL_MAX ||
-        config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
-        initTiedEmbeddingReductionForward(context);
-        return;
+static void initTiedEmbeddingReduceForward(NnCpuOpContext *context) {
+    const NnTiedEmbeddingReduceOpConfig *config =
+        (NnTiedEmbeddingReduceOpConfig *)context->opConfig;
+    ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    ASSERT_EQ(context->inputSize.x, config->tileCount * config->physicalSize);
+    ASSERT_EQ(context->outputSize.x, 1u);
+    ASSERT_EQ(context->inputSize.y, context->nBatches);
+    ASSERT_EQ(context->outputSize.y, context->nBatches);
+    assert(context->weightSize.nBytes == 0u);
+    assert(config->physicalSize >= config->hiddenSize + 2u && config->tileCount > 0u);
+    const NnBufferConfig *mix = &context->bufferConfigs[config->embeddingMixBufferIndex];
+    ASSERT_EQ(mix->size.floatType, F_32);
+    ASSERT_EQ(mix->size.x, config->physicalSize);
+    ASSERT_EQ(mix->size.y, context->nBatches);
+}
+
+static void initReduceMaxForward(NnCpuOpContext *context) {
+    const NnReduceMaxOpConfig *config = (NnReduceMaxOpConfig *)context->opConfig;
+    ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    ASSERT_EQ(context->inputSize.y, context->nBatches);
+    ASSERT_EQ(context->outputSize.y, context->nBatches);
+    ASSERT_EQ(context->outputSize.x, 1u);
+    assert(context->weightSize.nBytes == 0u);
+    if (config->useDivisor != 0u) {
+        ASSERT_EQ(context->pipeConfigs[config->divisorPipeIndex].size.x, 1u);
+        ASSERT_EQ(context->pipeConfigs[config->divisorPipeIndex].size.y, 1u);
     }
-    if (config->mode == TIED_EMBEDDING_PARTIAL) {
-        if (context->weightSize.floatType != F_32 && context->weightSize.floatType != F_Q40)
-            throw std::invalid_argument("TIED_EMBEDDING_PARTIAL supports F32 and Q40 embeddings");
-        if (context->inputSize.floatType != F_32 && context->inputSize.floatType != F_Q80)
-            throw std::invalid_argument("TIED_EMBEDDING_PARTIAL supports F32 and Q80 hidden states");
-        ASSERT_EQ(context->outputSize.floatType, F_32);
-        ASSERT_EQ(context->inputSize.x, context->weightSize.x);
-        ASSERT_EQ(context->outputSize.x, context->weightSize.y);
-        ASSERT_EQ(context->inputSize.y, context->nBatches);
-        ASSERT_EQ(context->outputSize.y, context->nBatches);
-        assert(config->tileSize > 0u && config->tileCount > 0u);
-        assert(config->tileCount == (context->weightSize.y + config->tileSize - 1u) / config->tileSize);
-        assert(config->physicalSize >= context->inputSize.x + 2u);
-        assert(config->logitSoftcap > 0.0f && std::isfinite(config->logitSoftcap));
-        const NnBufferConfig *partial = &context->bufferConfigs[config->partialBufferIndex];
-        ASSERT_EQ(partial->size.floatType, F_32);
-        ASSERT_EQ(partial->size.x, config->tileCount * config->physicalSize);
-        ASSERT_EQ(partial->size.y, context->nBatches);
-        const NnPipeConfig *temperature = &context->pipeConfigs[config->temperaturePipeIndex];
-        ASSERT_EQ(temperature->size.floatType, F_32);
-        assert(temperature->size.length == 1u);
-        return;
-    }
-    if (config->mode == TIED_EMBEDDING_REDUCE) {
-        ASSERT_EQ(context->inputSize.floatType, F_32);
-        ASSERT_EQ(context->outputSize.floatType, F_32);
-        ASSERT_EQ(context->inputSize.x, config->tileCount * config->physicalSize);
-        ASSERT_EQ(context->outputSize.x, 1u);
-        ASSERT_EQ(context->inputSize.y, context->nBatches);
-        ASSERT_EQ(context->outputSize.y, context->nBatches);
-        assert(context->weightSize.nBytes == 0u);
-        assert(config->physicalSize >= config->hiddenSize + 2u && config->tileCount > 0u);
-        assert(config->nNodes > 0u && config->nodeIndex < config->nNodes);
-        const NnBufferConfig *mix = &context->bufferConfigs[config->embeddingMixBufferIndex];
-        ASSERT_EQ(mix->size.floatType, F_32);
-        ASSERT_EQ(mix->size.x, config->physicalSize);
-        ASSERT_EQ(mix->size.y, context->nBatches);
-        return;
-    }
+}
+
+static void initEmbeddingMixRescaleForward(NnCpuOpContext *context) {
+    const NnEmbeddingMixRescaleOpConfig *config =
+        (NnEmbeddingMixRescaleOpConfig *)context->opConfig;
+    ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    ASSERT_EQ(context->inputSize.x, context->outputSize.x);
+    ASSERT_EQ(context->inputSize.y, context->nBatches);
+    ASSERT_EQ(context->outputSize.y, context->nBatches);
+    assert(context->weightSize.nBytes == 0u);
+    const NnBufferConfig *maximum = &context->bufferConfigs[config->globalMaxBufferIndex];
+    ASSERT_EQ(maximum->size.floatType, F_32);
+    ASSERT_EQ(maximum->size.x, 1u);
+    ASSERT_EQ(maximum->size.y, context->nBatches);
+    const NnPipeConfig *localMaximum = &context->pipeConfigs[config->vocabularyMaxPipeIndex];
+    ASSERT_EQ(localMaximum->size.floatType, F_32);
+    ASSERT_EQ(localMaximum->size.x, config->nNodes);
+    ASSERT_EQ(localMaximum->size.y, context->nBatches);
+    assert(config->nNodes > 0u && config->nodeIndex < config->nNodes);
+}
+
+static void initEmbeddingMixFinalizeForward(NnCpuOpContext *context) {
+    const NnEmbeddingMixFinalizeOpConfig *config =
+        (NnEmbeddingMixFinalizeOpConfig *)context->opConfig;
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_32);
     ASSERT_EQ(context->inputSize.y, context->nBatches);
     ASSERT_EQ(context->outputSize.y, context->nBatches);
     assert(context->weightSize.nBytes == 0u);
-    if (config->mode == TIED_EMBEDDING_RESCALE) {
-        ASSERT_EQ(context->inputSize.x, context->outputSize.x);
-        const NnBufferConfig *maximum = &context->bufferConfigs[config->globalMaxBufferIndex];
-        ASSERT_EQ(maximum->size.floatType, F_32);
-        ASSERT_EQ(maximum->size.x, 1u);
-        ASSERT_EQ(maximum->size.y, context->nBatches);
-        const NnPipeConfig *localMaximum = &context->pipeConfigs[config->vocabularyMaxPipeIndex];
-        ASSERT_EQ(localMaximum->size.floatType, F_32);
-        ASSERT_EQ(localMaximum->size.x, config->nNodes);
-        ASSERT_EQ(localMaximum->size.y, context->nBatches);
-        assert(config->nodeIndex < config->nNodes);
-    } else if (config->mode == TIED_EMBEDDING_FINALIZE) {
-        const NnUint physicalSize = config->physicalSize == 0u
-            ? context->outputSize.x + 1u
-            : config->physicalSize;
-        ASSERT_EQ(context->inputSize.x, physicalSize);
-        assert(physicalSize >= context->outputSize.x + 1u);
-    } else {
-        throw std::invalid_argument("TIED_EMBEDDING has an invalid mode");
-    }
+    const NnUint physicalSize = config->physicalSize == 0u
+        ? context->outputSize.x + 1u
+        : config->physicalSize;
+    ASSERT_EQ(context->inputSize.x, physicalSize);
+    assert(physicalSize >= context->outputSize.x + 1u);
 }
 
 static void tiedEmbeddingPartialForward_F32_F32_F32(
@@ -2054,7 +2065,8 @@ static void tiedEmbeddingPartialForward_F32_F32_F32(
     NnUint batchSize,
     NnCpuOpContext *context)
 {
-    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
+    const NnTiedEmbeddingPartialOpConfig *config =
+        (NnTiedEmbeddingPartialOpConfig *)context->opConfig;
     const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
     if (!(temperature > 0.0f) || !std::isfinite(temperature))
         throw std::runtime_error("TIED_EMBEDDING temperature must be finite and positive");
@@ -2081,7 +2093,8 @@ static void tiedEmbeddingPartialForward_Q80_Q40_F32(
     NnUint batchSize,
     NnCpuOpContext *context)
 {
-    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
+    const NnTiedEmbeddingPartialOpConfig *config =
+        (NnTiedEmbeddingPartialOpConfig *)context->opConfig;
     const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
     if (!(temperature > 0.0f) || !std::isfinite(temperature))
         throw std::runtime_error("TIED_EMBEDDING temperature must be finite and positive");
@@ -2107,7 +2120,8 @@ static void tiedEmbeddingReduceForward_F32_F32_F32(
     NnUint batchSize,
     NnCpuOpContext *context)
 {
-    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
+    const NnTiedEmbeddingReduceOpConfig *config =
+        (NnTiedEmbeddingReduceOpConfig *)context->opConfig;
     SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
     tiedEmbeddingReduce_F32(
         context->output,
@@ -2120,102 +2134,70 @@ static void tiedEmbeddingReduceForward_F32_F32_F32(
         batchEnd);
 }
 
-static void tiedEmbeddingForward_F32_F32_F32(
+static void reduceMaxForward_F32_F32(
     NnUint nThreads,
     NnUint threadIndex,
     NnUint batchSize,
     NnCpuOpContext *context)
 {
-    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
-    if (config->mode == TIED_EMBEDDING_PARTIAL) {
-        tiedEmbeddingPartialForward_F32_F32_F32(nThreads, threadIndex, batchSize, context);
-        return;
+    const NnReduceMaxOpConfig *config = (NnReduceMaxOpConfig *)context->opConfig;
+    float logitScale = 1.0f;
+    if (config->useDivisor != 0u) {
+        const float divisor = *(const float *)context->pipes[config->divisorPipeIndex];
+        if (!(divisor > 0.0f) || !std::isfinite(divisor))
+            throw std::runtime_error("REDUCE_MAX divisor must be finite and positive");
+        logitScale = 1.0f / divisor;
     }
-    if (config->mode == TIED_EMBEDDING_REDUCE) {
-        tiedEmbeddingReduceForward_F32_F32_F32(nThreads, threadIndex, batchSize, context);
-        return;
+    for (NnUint batchIndex = 0u; batchIndex < batchSize; batchIndex++) {
+        const float *input = (const float *)context->input[batchIndex];
+        float *output = (float *)context->output[batchIndex];
+        if (threadIndex == 0u)
+            output[0] = *std::max_element(input, input + context->inputSize.x) * logitScale;
     }
-    if (config->mode == TIED_EMBEDDING_LOCAL_MAX ||
-        config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
-        tiedEmbeddingReductionForward(nThreads, threadIndex, batchSize, context);
-        return;
+}
+
+static void embeddingMixRescaleForward_F32_F32(
+    NnUint nThreads,
+    NnUint threadIndex,
+    NnUint batchSize,
+    NnCpuOpContext *context)
+{
+    const NnEmbeddingMixRescaleOpConfig *config =
+        (NnEmbeddingMixRescaleOpConfig *)context->opConfig;
+    const float *localMaximum = reinterpret_cast<const float *>(
+        context->pipes[config->vocabularyMaxPipeIndex]);
+    const float *globalMaximum = reinterpret_cast<const float *>(
+        context->buffers[config->globalMaxBufferIndex]);
+    for (NnUint batch = 0u; batch < batchSize; ++batch) {
+        const float scale = expf(
+            localMaximum[batch * config->nNodes + config->nodeIndex] - globalMaximum[batch]);
+        const float *input = reinterpret_cast<const float *>(context->input[batch]);
+        float *output = reinterpret_cast<float *>(context->output[batch]);
+        SPLIT_THREADS(start, end, context->outputSize.x, nThreads, threadIndex);
+        for (NnUint i = start; i < end; ++i)
+            output[i] = input[i] * scale;
     }
-    if (config->mode == TIED_EMBEDDING_RESCALE) {
-        const float *localMaximum = reinterpret_cast<const float *>(
-            context->pipes[config->vocabularyMaxPipeIndex]);
-        const float *globalMaximum = reinterpret_cast<const float *>(
-            context->buffers[config->globalMaxBufferIndex]);
-        for (NnUint batch = 0u; batch < batchSize; ++batch) {
-            const float scale = expf(
-                localMaximum[batch * config->nNodes + config->nodeIndex] - globalMaximum[batch]);
-            const float *input = reinterpret_cast<const float *>(context->input[batch]);
-            float *output = reinterpret_cast<float *>(context->output[batch]);
-            SPLIT_THREADS(start, end, context->outputSize.x, nThreads, threadIndex);
-            for (NnUint i = start; i < end; ++i)
-                output[i] = input[i] * scale;
-        }
-        return;
-    }
+}
+
+static void embeddingMixFinalizeForward_F32_F32(
+    NnUint nThreads,
+    NnUint threadIndex,
+    NnUint batchSize,
+    NnCpuOpContext *context)
+{
+    const NnEmbeddingMixFinalizeOpConfig *config =
+        (NnEmbeddingMixFinalizeOpConfig *)context->opConfig;
     for (NnUint batch = 0u; batch < batchSize; ++batch) {
         const float *input = reinterpret_cast<const float *>(context->input[batch]);
         float *output = reinterpret_cast<float *>(context->output[batch]);
         const NnUint hiddenSize = context->outputSize.x;
         const float denominator = input[hiddenSize];
         if (!(denominator > 0.0f) || !std::isfinite(denominator))
-            throw std::runtime_error("TIED_EMBEDDING denominator must be finite and positive");
+            throw std::runtime_error("EMBEDDING_MIX_FINALIZE denominator must be finite and positive");
         const float factor = config->embeddingScale / denominator;
         SPLIT_THREADS(start, end, hiddenSize, nThreads, threadIndex);
         for (NnUint h = start; h < end; ++h)
             output[h] = input[h] * factor;
-    }
-}
-
-static void initTiedEmbeddingReductionForward(NnCpuOpContext *context) {
-    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
-    ASSERT_EQ(context->inputSize.floatType, F_32);
-    ASSERT_EQ(context->outputSize.floatType, F_32);
-    ASSERT_EQ(context->inputSize.y, context->nBatches);
-    ASSERT_EQ(context->outputSize.y, context->nBatches);
-    if (config->useTemperature != 0u) {
-        ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.x, 1u);
-        ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.y, 1u);
-    }
-
-    if (config->mode == TIED_EMBEDDING_LOCAL_MAX) {
-        assert(context->weightSize.nBytes == 0u);
-        ASSERT_EQ(context->outputSize.x, 1u);
-    } else if (config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
-        assert(context->weightSize.nBytes == 0u);
-        ASSERT_EQ(context->outputSize.x, 1u);
-    } else {
-        throw std::invalid_argument("TIED_EMBEDDING has an invalid reduction mode");
-    }
-}
-
-static void tiedEmbeddingReductionForward(
-    NnUint nThreads,
-    NnUint threadIndex,
-    NnUint batchSize,
-    NnCpuOpContext *context)
-{
-    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
-    float logitScale = 1.0f;
-    if (config->useTemperature != 0u) {
-        const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
-        if (!(temperature > 0.0f) || !std::isfinite(temperature))
-            throw std::runtime_error("TIED_EMBEDDING temperature must be finite and positive");
-        logitScale = 1.0f / temperature;
-    }
-    for (NnUint batchIndex = 0u; batchIndex < batchSize; batchIndex++) {
-        const float *input = (const float *)context->input[batchIndex];
-        float *output = (float *)context->output[batchIndex];
-        if (config->mode == TIED_EMBEDDING_LOCAL_MAX) {
-            if (threadIndex == 0u)
-                output[0] = *std::max_element(input, input + context->inputSize.x) * logitScale;
-        } else if (config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
-            if (threadIndex == 0u)
-                output[0] = *std::max_element(input, input + context->inputSize.x);
-        }
     }
 }
 
@@ -2684,8 +2666,16 @@ NnCpuOpForwardInit getCpuOpForwardInit(NnOpCode code, NnOpQuantType quantType) {
         return initMoeGateForward;
     if (code == OP_DIFFUSION_ATTENTION)
         return initDiffusionAttentionForward;
-    if (code == OP_TIED_EMBEDDING)
-        return initTiedEmbeddingForward;
+    if (code == OP_TIED_EMBEDDING_PARTIAL)
+        return initTiedEmbeddingPartialForward;
+    if (code == OP_TIED_EMBEDDING_REDUCE)
+        return initTiedEmbeddingReduceForward;
+    if (code == OP_REDUCE_MAX)
+        return initReduceMaxForward;
+    if (code == OP_EMBEDDING_MIX_RESCALE)
+        return initEmbeddingMixRescaleForward;
+    if (code == OP_EMBEDDING_MIX_FINALIZE)
+        return initEmbeddingMixFinalizeForward;
     if (code == OP_VOCAB_STATS)
         return initVocabStatsForward;
     return nullptr;
@@ -2756,12 +2746,25 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     if (code == OP_DIFFUSION_ATTENTION) {
         if (quantType == F32_F32_F32) return diffusionAttentionForward_F32_F32;
     }
-    if (code == OP_TIED_EMBEDDING) {
-        if (quantType == F32_F32_F32) return tiedEmbeddingForward_F32_F32_F32;
+    if (code == OP_TIED_EMBEDDING_PARTIAL) {
+        if (quantType == F32_F32_F32) return tiedEmbeddingPartialForward_F32_F32_F32;
         if (quantType == Q80_Q40_F32) return tiedEmbeddingPartialForward_Q80_Q40_F32;
     }
-    if (code == OP_VOCAB_STATS && quantType == F32_F32_F32)
-        return vocabStatsForward;
+    if (code == OP_TIED_EMBEDDING_REDUCE) {
+        if (quantType == F32_F32_F32) return tiedEmbeddingReduceForward_F32_F32_F32;
+    }
+    if (code == OP_REDUCE_MAX) {
+        if (quantType == F32_F32_F32) return reduceMaxForward_F32_F32;
+    }
+    if (code == OP_EMBEDDING_MIX_RESCALE) {
+        if (quantType == F32_F32_F32) return embeddingMixRescaleForward_F32_F32;
+    }
+    if (code == OP_EMBEDDING_MIX_FINALIZE) {
+        if (quantType == F32_F32_F32) return embeddingMixFinalizeForward_F32_F32;
+    }
+    if (code == OP_VOCAB_STATS) {
+        if (quantType == F32_F32_F32) return vocabStatsForward;
+    }
     if (code == OP_TANH) {
         if (quantType == F32_F32_F32) return tanhForward_F32_F32;
     }

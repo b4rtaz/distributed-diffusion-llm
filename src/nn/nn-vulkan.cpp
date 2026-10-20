@@ -543,8 +543,8 @@ void NnVulkanDevice::writeBuffer(NnUint bufferIndex, const NnByte *source) {
 }
 
 static bool isTiledQ40Embedding(const NnOpConfig *op) {
-    return op->code == OP_TIED_EMBEDDING && op->weightSize.floatType == F_Q40 &&
-        reinterpret_cast<const NnTiedEmbeddingOpConfig *>(op->config)->mode == TIED_EMBEDDING_PARTIAL;
+    return op->code == OP_TIED_EMBEDDING_PARTIAL &&
+        op->weightSize.floatType == F_Q40;
 }
 
 static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuantType quantType) {
@@ -577,24 +577,21 @@ static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuant
     if (opCode == OP_DIFFUSION_ATTENTION) {
         if (quantType == F32_F32_F32) return "diffusion-attention-forward-f32-f32.spv";
     }
-    if (opCode == OP_TIED_EMBEDDING) {
-        const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
-        if (config->mode == TIED_EMBEDDING_PARTIAL) {
-            if (quantType == F32_F32_F32) return "tied-embedding-partial-forward-f32-f32-f32.spv";
-            if (quantType == Q80_Q40_F32) return "tied-embedding-logits-forward-q80-q40-f32.spv";
-        }
-        if (config->mode == TIED_EMBEDDING_REDUCE) {
-            if (quantType == F32_F32_F32) return "tied-embedding-reduce-forward-f32-f32.spv";
-        }
-        if (config->mode == TIED_EMBEDDING_RESCALE) {
-            if (quantType == F32_F32_F32) return "tied-embedding-rescale-forward-f32-f32.spv";
-        }
-        if (config->mode == TIED_EMBEDDING_LOCAL_MAX || config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
-            if (quantType == F32_F32_F32) return "embedding-mix-max-forward-f32-f32.spv";
-        }
-        if (config->mode == TIED_EMBEDDING_FINALIZE) {
-            if (quantType == F32_F32_F32) return "embedding-mix-finalize-forward-f32-f32.spv";
-        }
+    if (opCode == OP_TIED_EMBEDDING_PARTIAL) {
+        if (quantType == F32_F32_F32) return "tied-embedding-partial-forward-f32-f32-f32.spv";
+        if (quantType == Q80_Q40_F32) return "tied-embedding-logits-forward-q80-q40-f32.spv";
+    }
+    if (opCode == OP_TIED_EMBEDDING_REDUCE) {
+        if (quantType == F32_F32_F32) return "tied-embedding-reduce-forward-f32-f32.spv";
+    }
+    if (opCode == OP_REDUCE_MAX) {
+        if (quantType == F32_F32_F32) return "embedding-mix-max-forward-f32-f32.spv";
+    }
+    if (opCode == OP_EMBEDDING_MIX_RESCALE) {
+        if (quantType == F32_F32_F32) return "tied-embedding-rescale-forward-f32-f32.spv";
+    }
+    if (opCode == OP_EMBEDDING_MIX_FINALIZE) {
+        if (quantType == F32_F32_F32) return "embedding-mix-finalize-forward-f32-f32.spv";
     }
     if (opCode == OP_VOCAB_STATS) {
         if (quantType == F32_F32_F32) return "vocab-stats-forward-f32-f32.spv";
@@ -719,21 +716,28 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->keyCacheBufferIndex)});
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->valueCacheBufferIndex)});
         } break;
-        case OP_TIED_EMBEDDING: {
-            const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
-            if (config->mode == TIED_EMBEDDING_PARTIAL) {
-                a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->partialBufferIndex)});
-                a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
-                if (isTiledQ40Embedding(opConfig))
-                    a.push_back({ACCESS_READ_WRITE, segmentData->resolveTiedProbabilityBuffer(opIndex)});
-            } else if (config->mode == TIED_EMBEDDING_REDUCE) {
-                a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->embeddingMixBufferIndex)});
-            } else if (config->mode == TIED_EMBEDDING_RESCALE) {
-                a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->vocabularyMaxPipeIndex)});
-                a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->globalMaxBufferIndex)});
-            } else if (config->mode == TIED_EMBEDDING_LOCAL_MAX || config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
-                a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
-            }
+        case OP_TIED_EMBEDDING_PARTIAL: {
+            const NnTiedEmbeddingPartialOpConfig *config =
+                (NnTiedEmbeddingPartialOpConfig *)opConfig->config;
+            a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->partialBufferIndex)});
+            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
+            if (isTiledQ40Embedding(opConfig))
+                a.push_back({ACCESS_READ_WRITE, segmentData->resolveTiedProbabilityBuffer(opIndex)});
+        } break;
+        case OP_TIED_EMBEDDING_REDUCE: {
+            const NnTiedEmbeddingReduceOpConfig *config =
+                (NnTiedEmbeddingReduceOpConfig *)opConfig->config;
+            a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->embeddingMixBufferIndex)});
+        } break;
+        case OP_REDUCE_MAX: {
+            const NnReduceMaxOpConfig *config = (NnReduceMaxOpConfig *)opConfig->config;
+            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->divisorPipeIndex)});
+        } break;
+        case OP_EMBEDDING_MIX_RESCALE: {
+            const NnEmbeddingMixRescaleOpConfig *config =
+                (NnEmbeddingMixRescaleOpConfig *)opConfig->config;
+            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->vocabularyMaxPipeIndex)});
+            a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->globalMaxBufferIndex)});
         } break;
         case OP_VOCAB_STATS: {
             const NnVocabStatsOpConfig *config = (NnVocabStatsOpConfig *)opConfig->config;
@@ -850,12 +854,15 @@ static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, co
         consts.push_back(inputSize.x);
         consts.push_back(config->k);
     }
-    if (opConfig->code == OP_TIED_EMBEDDING) {
-        const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
-        if (config->mode == TIED_EMBEDDING_PARTIAL)
-            consts.push_back(config->hiddenSize);
-        else if (config->mode == TIED_EMBEDDING_REDUCE)
-            consts.push_back(config->tileCount);
+    if (opConfig->code == OP_TIED_EMBEDDING_PARTIAL) {
+        const NnTiedEmbeddingPartialOpConfig *config =
+            (NnTiedEmbeddingPartialOpConfig *)opConfig->config;
+        consts.push_back(config->hiddenSize);
+    }
+    if (opConfig->code == OP_TIED_EMBEDDING_REDUCE) {
+        const NnTiedEmbeddingReduceOpConfig *config =
+            (NnTiedEmbeddingReduceOpConfig *)opConfig->config;
+        consts.push_back(config->tileCount);
     }
     return consts;
 }
@@ -891,17 +898,16 @@ static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const
         return ((NnMultiHeadAttOpConfig *)opConfig->config)->nHeads0;
     if (opConfig->code == OP_DIFFUSION_ATTENTION)
         return ((NnDiffusionAttentionOpConfig *)opConfig->config)->nQueryHeads;
-    if (opConfig->code == OP_TIED_EMBEDDING) {
-        const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
-        if (config->mode == TIED_EMBEDDING_PARTIAL)
-            return config->tileCount;
-        if (config->mode == TIED_EMBEDDING_RESCALE ||
-            config->mode == TIED_EMBEDDING_FINALIZE) {
-            constexpr NnUint chunkSize = 32u; // Shader local size
-            return (outputSize.x + chunkSize - 1u) / chunkSize;
-        }
-        return 1u;
+    if (opConfig->code == OP_TIED_EMBEDDING_PARTIAL)
+        return ((NnTiedEmbeddingPartialOpConfig *)opConfig->config)->tileCount;
+    if (opConfig->code == OP_EMBEDDING_MIX_RESCALE ||
+        opConfig->code == OP_EMBEDDING_MIX_FINALIZE) {
+        constexpr NnUint chunkSize = 32u; // Shader local size
+        return (outputSize.x + chunkSize - 1u) / chunkSize;
     }
+    if (opConfig->code == OP_TIED_EMBEDDING_REDUCE ||
+        opConfig->code == OP_REDUCE_MAX)
+        return 1u;
     if (opConfig->code == OP_VOCAB_STATS) {
         const NnVocabStatsOpConfig *config = (NnVocabStatsOpConfig *)opConfig->config;
         return config->mode == VOCAB_STATS_LOCAL ? config->microshardCount : 1u;
@@ -1346,7 +1352,7 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
             const NnSize3D outputSize = data->resolveBufferSize(&opConfig->output);
 
             if (isTiledQ40Embedding(opConfig)) {
-                const auto *config = reinterpret_cast<const NnTiedEmbeddingOpConfig *>(opConfig->config);
+                const auto *config = reinterpret_cast<const NnTiedEmbeddingPartialOpConfig *>(opConfig->config);
                 commandBuffer.pushConstants(pipelineLayouts[opIndex], vk::ShaderStageFlagBits::eCompute,
                     0u, sizeof(batchSize), &batchSize);
                 const NnUint vocab = data->resolveBufferBatchWidth(&opConfig->output);

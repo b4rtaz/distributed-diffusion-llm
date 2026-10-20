@@ -89,9 +89,13 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_SOFTMAX) return "SOFTMAX";
     if (code == OP_MOE_GATE) return "MOE_GATE";
     if (code == OP_DIFFUSION_ATTENTION) return "DIFFUSION_ATTENTION";
-    if (code == OP_TIED_EMBEDDING) return "TIED_EMBEDDING";
+    if (code == OP_TIED_EMBEDDING_PARTIAL) return "TIED_EMBEDDING_PARTIAL";
     if (code == OP_TANH) return "TANH";
     if (code == OP_VOCAB_STATS) return "VOCAB_STATS";
+    if (code == OP_TIED_EMBEDDING_REDUCE) return "TIED_EMBEDDING_REDUCE";
+    if (code == OP_REDUCE_MAX) return "REDUCE_MAX";
+    if (code == OP_EMBEDDING_MIX_RESCALE) return "EMBEDDING_MIX_RESCALE";
+    if (code == OP_EMBEDDING_MIX_FINALIZE) return "EMBEDDING_MIX_FINALIZE";
     throw std::invalid_argument("Unknown op code: " + std::to_string(code));
 }
 

@@ -62,9 +62,7 @@ void run(const DiffusionGemmaModelFile &model, NnUint threads, NnUint batches,
     }
     for (NnUint s = graph.decoderDenoise.first; s <= graph.decoderDenoise.last; ++s) {
         const auto &segment = graph.nodes[0].segments[s];
-        if (segment.nOps && segment.ops[0].code == OP_TIED_EMBEDDING &&
-            reinterpret_cast<const NnTiedEmbeddingOpConfig *>(segment.ops[0].config)->mode ==
-                TIED_EMBEDDING_PARTIAL)
+        if (segment.nOps && segment.ops[0].code == OP_TIED_EMBEDDING_PARTIAL)
             headSegment = s;
     }
     if (quantIndex == UINT32_MAX || mixIndex == UINT32_MAX || headSegment == UINT32_MAX)
