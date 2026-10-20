@@ -15,6 +15,7 @@ __pycache__/
 /nn-cpu-test
 /nn-cpu-ops-test
 /nn-diffusion-attention-probe
+/nn-tied-embedding-bench
 /nn-executor-test
 /nn-vulkan-test
 /gemma-tokenizer-test
@@ -24,3 +25,7 @@ __pycache__/
 /diffusion-gemma-runtime-test
 /diffusion-gemma-distributed-test
 /diffusion-gemma-checkpoint-probe
+
+plan.md
+readme.md
+test*.sh

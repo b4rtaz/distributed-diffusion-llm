@@ -191,8 +191,8 @@ static inline void *executorThreadHandler(void *arg) {
                 context->totalTime[step->type] += time;
                 context->timer->reset();
 
-                // if (step->opConfig != nullptr)
-                //    printf("Op %s took %u microseconds\n", opCodeToString(step->opConfig->code), time);
+                if (step->opConfig != nullptr)
+                    printf("Op %s took %u microseconds\n", opCodeToString(step->opConfig->code), time);
             }
 
             context->doneThreadCount.store(0);

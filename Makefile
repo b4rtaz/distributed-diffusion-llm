@@ -51,7 +51,7 @@ TOKENIZER ?= model/diffusion-gemma.ddlt
 all: ddllm
 
 clean:
-	$(DELETE_CMD) *.o *.d ddllm nn-cpu-test nn-cpu-ops-test nn-diffusion-attention-probe nn-executor-test nn-vulkan-test gemma-tokenizer-test diffusion-gemma-loader-test diffusion-gemma-test diffusion-gemma-generation-test diffusion-gemma-runtime-test diffusion-gemma-distributed-test src/nn/vulkan/*.spv *.exe
+	$(DELETE_CMD) *.o *.d ddllm nn-cpu-test nn-cpu-ops-test nn-diffusion-attention-probe nn-tied-embedding-bench nn-executor-test nn-vulkan-test gemma-tokenizer-test diffusion-gemma-loader-test diffusion-gemma-test diffusion-gemma-generation-test diffusion-gemma-runtime-test diffusion-gemma-distributed-test src/nn/vulkan/*.spv *.exe
 
 nn-quants.o: src/nn/nn-quants.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
@@ -113,6 +113,9 @@ nn-cpu-ops-test: src/nn/nn-cpu-ops-test.cpp nn-quants.o nn-core.o nn-executor.o 
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(filter %.o,$^) -o $@ $(LIBS)
 
 nn-diffusion-attention-probe: src/nn/nn-diffusion-attention-probe.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu.o
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(filter %.o,$^) -o $@ $(LIBS)
+
+nn-tied-embedding-bench: src/nn/nn-tied-embedding-bench.cpp diffusion-gemma-loader.o diffusion-gemma.o diffusion-gemma-generation.o diffusion-gemma-runtime.o $(NN_OBJECTS) $(VULKAN_SHADER_BINS)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $< $(filter %.o,$^) -o $@ $(LIBS)
 
 nn-executor-test: src/nn/nn-executor-test.cpp nn-quants.o nn-core.o nn-executor.o llamafile-sgemm.o nn-cpu-ops.o nn-cpu.o

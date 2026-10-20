@@ -641,35 +641,39 @@ void testTiedEmbedding(float temperature = 0.7f) {
         dequantizeQ40toF32(quantEmbedding.data(), effectiveEmbedding.data(), embedding.size(), 1u, 0u);
     }
 
+    float rawLogits[batches][vocab];
     float logits[batches][vocab];
     float partials[batches][tileCount * physicalSize];
     float mix[batches][physicalSize];
     float maxima[batches * nNodes];
     std::fill(maxima, maxima + batches * nNodes, -123.0f);
     NnByte *logitRows[batches];
-    NnByte *hiddenRows[batches];
+    NnByte *rawLogitRows[batches];
     NnByte *partialRows[batches];
     NnByte *maximumRows[batches];
     for (NnUint batch = 0u; batch < batches; ++batch) {
+        for (NnUint token = 0u; token < vocab; ++token)
+            rawLogits[batch][token] = dotProduct_F32(
+                effectiveHidden.data() + batch * hiddenSize,
+                effectiveEmbedding.data() + token * hiddenSize,
+                hiddenSize);
         logitRows[batch] = reinterpret_cast<NnByte *>(logits[batch]);
+        rawLogitRows[batch] = reinterpret_cast<NnByte *>(rawLogits[batch]);
         partialRows[batch] = reinterpret_cast<NnByte *>(partials[batch]);
         maximumRows[batch] = reinterpret_cast<NnByte *>(
             &maxima[batch * nNodes + nodeIndex]);
-        hiddenRows[batch] = quantized
-            ? reinterpret_cast<NnByte *>(quantHidden.data() + batch * hiddenSize / Q80_BLOCK_SIZE)
-            : reinterpret_cast<NnByte *>(hidden.data() + batch * hiddenSize);
     }
 
     auto work = [&](NnUint thread) {
         SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
         if (quantized) {
-            tiedEmbeddingPartial_Q80_Q40_F32(
-                logitRows, hiddenRows, quantEmbedding.data(), &partials[0][0],
+            tiedEmbeddingPartial_F32_Q40_F32(
+                logitRows, rawLogitRows, quantEmbedding.data(), &partials[0][0],
                 vocab, hiddenSize, physicalSize, tileCount,
                 1.0f / temperature, softcap, batchStart, batchEnd);
         } else {
             tiedEmbeddingPartial_F32_F32_F32(
-                logitRows, hiddenRows, embedding.data(), &partials[0][0],
+                logitRows, rawLogitRows, embedding.data(), &partials[0][0],
                 vocab, hiddenSize, physicalSize, tileCount,
                 1.0f / temperature, softcap, batches, batchStart, batchEnd);
         }

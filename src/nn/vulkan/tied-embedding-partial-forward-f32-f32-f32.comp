@@ -17,7 +17,7 @@ struct BatchInfo {
     uint outputSizeX;
 };
 
-layout(binding = 0) readonly buffer inputBuffer { float hidden[]; };
+layout(binding = 0) readonly buffer inputBuffer { float inputLogits[]; };
 layout(binding = 1) writeonly buffer outputBuffer { float logits[]; };
 layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
 layout(binding = 3) readonly buffer weightBuffer { float embedding[]; };
@@ -35,7 +35,6 @@ layout(binding = 6) readonly buffer temperatureBuffer { float temperature[]; };
 
 shared float decodedRow[HIDDEN_SIZE];
 shared float numerator[HIDDEN_SIZE];
-shared float subgroupSums[N_THREADS];
 shared float runningMaximum;
 shared float denominator;
 shared float oldScale;
@@ -56,21 +55,11 @@ void main() {
     barrier();
 
     for (uint token = tokenStart; token < tokenEnd; ++token) {
-        float sum = 0.0f;
-        for (uint h = lane; h < HIDDEN_SIZE; h += N_THREADS) {
-            const float value = embedding[token * HIDDEN_SIZE + h];
-            decodedRow[h] = value;
-            sum += hidden[info.inputOffset + h] * value;
-        }
-        const float subgroupSum = subgroupAdd(sum);
-        if (subgroupElect())
-            subgroupSums[gl_SubgroupID] = subgroupSum;
-        barrier();
+        for (uint h = lane; h < HIDDEN_SIZE; h += N_THREADS)
+            decodedRow[h] = embedding[token * HIDDEN_SIZE + h];
 
         if (lane == 0u) {
-            float rawLogit = 0.0f;
-            for (uint subgroupIndex = 0u; subgroupIndex < gl_NumSubgroups; ++subgroupIndex)
-                rawLogit += subgroupSums[subgroupIndex];
+            const float rawLogit = inputLogits[info.inputOffset + token];
             const float logit = logitSoftcap * tanh(rawLogit / logitSoftcap);
             logits[info.outputOffset + token] = logit;
             const float score = logit * inverseTemperature;

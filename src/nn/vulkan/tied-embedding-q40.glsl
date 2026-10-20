@@ -15,7 +15,11 @@ struct BatchInfo {
 struct BlockQ80 { float16_t d; int8_t qs[32]; };
 struct BlockQ40 { float16_t d; uint8_t qs[16]; };
 
+#ifdef TIED_EMBEDDING_Q40_HIDDEN_INPUT
 layout(binding = 0) readonly buffer inputBuffer { BlockQ80 hidden[]; };
+#else
+layout(binding = 0) readonly buffer inputBuffer { float inputLogits[]; };
+#endif
 layout(binding = 1) buffer outputBuffer { float logits[]; };
 layout(binding = 2) uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
 layout(binding = 3) readonly buffer weightBuffer { BlockQ40 embedding[]; };

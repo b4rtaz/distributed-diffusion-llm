@@ -14,8 +14,12 @@ void main() {
     const uint end = min(start + tileSize, info.outputSizeX);
     const float inverseTemperature = 1.0f / temperature[0];
     float maximum = -3.402823466e+38f;
-    for (uint t = start + lane; t < end; t += 128u)
-        maximum = max(maximum, logits[info.outputOffset + t] * inverseTemperature);
+    for (uint t = start + lane; t < end; t += 128u) {
+        const uint offset = info.outputOffset + t;
+        const float logit = logitSoftcap * tanh(inputLogits[info.inputOffset + t] / logitSoftcap);
+        logits[offset] = logit;
+        maximum = max(maximum, logit * inverseTemperature);
+    }
     values[lane] = maximum;
     barrier();
     for (uint stride = 64u; stride > 0u; stride >>= 1u) {

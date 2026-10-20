@@ -734,8 +734,13 @@ void testTiedEmbedding_F32() {
                 size2D(F_32, capacity, tileCount * physicalSize));
             const NnUint localMixBufferIndex = nodeBuilder->addBuffer("local_mix",
                 size2D(F_32, capacity, physicalSize));
-            segmentBuilder->addOp(OP_TIED_EMBEDDING_PARTIAL, "tied_embedding_weight", 0u,
+            segmentBuilder->addOp(OP_MATMUL, "tied_embedding_weight", 0u,
                 pointerBatchConfig(SRC_PIPE, hiddenPipeIndex),
+                pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
+                size2D(quantized ? F_Q40 : F_32, hiddenSize, vocabSize),
+                NnMatmulOpConfig{0u, 0u, 0u});
+            segmentBuilder->addOp(OP_TIED_EMBEDDING_PARTIAL, "tied_embedding_weight", 0u,
+                pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 size2D(quantized ? F_Q40 : F_32, vocabSize, hiddenSize),
                 NnTiedEmbeddingPartialOpConfig{temperaturePipeIndex,

@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#define TIED_EMBEDDING_Q40_HIDDEN_INPUT
 #include "tied-embedding-q40.glsl"
 
 // Eight vocabulary rows by four canvas positions, reduced over 16 block lanes.

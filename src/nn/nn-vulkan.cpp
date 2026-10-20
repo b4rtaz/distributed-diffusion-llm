@@ -579,7 +579,7 @@ static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuant
     }
     if (opCode == OP_TIED_EMBEDDING_PARTIAL) {
         if (quantType == F32_F32_F32) return "tied-embedding-partial-forward-f32-f32-f32.spv";
-        if (quantType == Q80_Q40_F32) return "tied-embedding-logits-forward-q80-q40-f32.spv";
+        if (quantType == F32_Q40_F32) return "tied-embedding-softmax-forward-q40.spv";
     }
     if (opCode == OP_TIED_EMBEDDING_REDUCE) {
         if (quantType == F32_F32_F32) return "tied-embedding-reduce-forward-f32-f32.spv";
@@ -1216,7 +1216,6 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanS
         pipelines[opIndex] = context->device.createComputePipelines(pipelineCache, pipelineInfo).value.front();
         if (tiled) {
             const char *stages[] = {
-                "tied-embedding-softmax-forward-q40.spv",
                 "tied-embedding-mix-forward-q40.spv",
             };
             for (const char *file : stages) {
@@ -1355,23 +1354,17 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
                 const auto *config = reinterpret_cast<const NnTiedEmbeddingPartialOpConfig *>(opConfig->config);
                 commandBuffer.pushConstants(pipelineLayouts[opIndex], vk::ShaderStageFlagBits::eCompute,
                     0u, sizeof(batchSize), &batchSize);
-                const NnUint vocab = data->resolveBufferBatchWidth(&opConfig->output);
-                commandBuffer.dispatch((vocab + 7u) / 8u, (batchSize + 3u) / 4u, 1u);
-                // Internal dispatches share logits, probabilities and partials.
-                // Finish their writes before the next dispatch consumes them.
+                commandBuffer.dispatch(config->tileCount, batchSize, 1u);
+                // The softmax dispatch writes probabilities and partial
+                // statistics consumed by the weighted embedding mix.
                 const vk::MemoryBarrier barrier(vk::AccessFlagBits::eShaderWrite,
                     vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
-                for (NnUint stage = 0u; stage < 2u; ++stage) {
-                    commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-                        vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(),
-                        {barrier}, {}, {});
-                    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, tiedPipelines[opIndex][stage]);
-                    if (stage == 0u)
-                        commandBuffer.dispatch(config->tileCount, batchSize, 1u);
-                    else
-                        commandBuffer.dispatch(config->tileCount * (config->hiddenSize / Q40_BLOCK_SIZE),
-                            (batchSize + 7u) / 8u, 1u);
-                }
+                commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                    vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(),
+                    {barrier}, {}, {});
+                commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, tiedPipelines[opIndex][0]);
+                commandBuffer.dispatch(config->tileCount * (config->hiddenSize / Q40_BLOCK_SIZE),
+                    (batchSize + 7u) / 8u, 1u);
                 continue;
             }
             const NnUint groupCountX = resolveShaderNumberOfWorkGroupsX(opConfig, inputSize, outputSize);

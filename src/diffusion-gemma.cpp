@@ -587,22 +587,20 @@ struct NodeBuilder {
     void addLogitsSegment(bool decoder) {
         NnSegmentConfigBuilder s;
         castForMatmul(s, x, quantHidden, decoder ? "decoder.quantize_logits" : "encoder.quantize_logits");
-        if (decoder) {
-            node.addSegment(s.build());
-            return;
-        }
         s.addOp(OP_MATMUL, "token_embedding.weight", 0u,
             pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
             size2D(weightType, h.hiddenSize, localVocab()), embeddingWeight,
             NnMatmulOpConfig{0u, 0u, expertIndexes});
-        s.addOp(OP_SCALE, "logits.pre_softcap", 0u,
-            pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(),
-            NnScaleOpCodeConfig{0u, 1.0f / h.logitSoftcap, 1u});
-        s.addOp(OP_TANH, "logits.tanh", 0u,
-            pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(), NnTanhOpCodeConfig{});
-        s.addOp(OP_SCALE, "logits.post_softcap", 0u,
-            pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(),
-            NnScaleOpCodeConfig{0u, h.logitSoftcap, 1u});
+        if (!decoder) {
+            s.addOp(OP_SCALE, "logits.pre_softcap", 0u,
+                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(),
+                NnScaleOpCodeConfig{0u, 1.0f / h.logitSoftcap, 1u});
+            s.addOp(OP_TANH, "logits.tanh", 0u,
+                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(), NnTanhOpCodeConfig{});
+            s.addOp(OP_SCALE, "logits.post_softcap", 0u,
+                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(),
+                NnScaleOpCodeConfig{0u, h.logitSoftcap, 1u});
+        }
         node.addSegment(s.build());
     }
 
@@ -613,7 +611,7 @@ struct NodeBuilder {
             const NnUint tileSize = tiedEmbeddingTileSize();
             const NnUint tileCount = (localVocab() + tileSize - 1u) / tileSize;
             maxima.addOp(OP_TIED_EMBEDDING_PARTIAL, "token_embedding.weight", 0u,
-                pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
+                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
                 size2D(weightType, localVocab(), h.hiddenSize), embeddingWeight,
                 NnTiedEmbeddingPartialOpConfig{pipes.temperature, partialEmbeddingMix,
                     mixWidth, tileSize, tileCount, h.hiddenSize, h.logitSoftcap});

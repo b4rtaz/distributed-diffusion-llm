@@ -62,8 +62,9 @@ void run(const DiffusionGemmaModelFile &model, NnUint threads, NnUint batches,
     }
     for (NnUint s = graph.decoderDenoise.first; s <= graph.decoderDenoise.last; ++s) {
         const auto &segment = graph.nodes[0].segments[s];
-        if (segment.nOps && segment.ops[0].code == OP_TIED_EMBEDDING_PARTIAL)
-            headSegment = s;
+        for (NnUint op = 0u; op < segment.nOps; ++op)
+            if (segment.ops[op].code == OP_TIED_EMBEDDING_PARTIAL)
+                headSegment = s;
     }
     if (quantIndex == UINT32_MAX || mixIndex == UINT32_MAX || headSegment == UINT32_MAX)
         throw std::runtime_error("missing tied-embedding graph buffers or segment");
