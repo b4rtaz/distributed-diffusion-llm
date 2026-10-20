@@ -1,5 +1,6 @@
 #include "diffusion-gemma-loader.hpp"
 #include "json.hpp"
+#include "mmap.hpp"
 #include "nn/nn-network.hpp"
 
 #include <algorithm>
@@ -111,7 +112,8 @@ std::vector<std::uint64_t> shape(std::initializer_list<std::uint64_t> values) {
 
 } // namespace
 
-DiffusionGemmaModelFile::DiffusionGemmaModelFile(const char *path) : path_(path == NULL ? "" : path) {
+DiffusionGemmaModelFile::DiffusionGemmaModelFile(const char *path)
+    : path_(path == NULL ? "" : path), mappedFile_() {
     if (path_.empty()) throw std::runtime_error("DDLM model path is empty");
     std::ifstream file(path_.c_str(), std::ios::binary);
     if (!file) throw std::runtime_error("Failed to open DDLM model: " + path_);
@@ -132,6 +134,8 @@ DiffusionGemmaModelFile::DiffusionGemmaModelFile(const char *path) : path_(path 
         throw std::runtime_error("Unsupported DDLM model format or byte order");
     if (actualSize < 0 || static_cast<std::uint64_t>(actualSize) != declaredSize)
         throw std::runtime_error("DDLM model file-size mismatch");
+    if (declaredSize > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+        throw std::runtime_error("DDLM model is too large to map");
     if (directoryOffset != headerSize + metadataSize || dataOffset > declaredSize || dataOffset % DDLM_ALIGNMENT != 0)
         throw std::runtime_error("Invalid DDLM model section offsets");
     if (metadataSize > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
@@ -259,6 +263,14 @@ DiffusionGemmaModelFile::DiffusionGemmaModelFile(const char *path) : path_(path 
     }
     if (end != declaredSize) throw std::runtime_error("DDLM model has unaccounted trailing bytes");
     validateManifest();
+    file.close();
+    mappedFile_.reset(new MmapFile());
+    openMmapFile(mappedFile_.get(), path_.c_str(), static_cast<std::size_t>(declaredSize));
+}
+
+DiffusionGemmaModelFile::~DiffusionGemmaModelFile() {
+    if (mappedFile_.get() != NULL)
+        closeMmapFile(mappedFile_.get());
 }
 
 const DiffusionGemmaTensor &DiffusionGemmaModelFile::tensor(const std::string &name) const {
@@ -273,13 +285,14 @@ void DiffusionGemmaModelFile::readTensor(const std::string &name, void *destinat
 
 void DiffusionGemmaModelFile::readTensorBytes(const std::string &name, std::uint64_t offset, void *destination, std::size_t bytes) const {
     const DiffusionGemmaTensor &entry = tensor(name);
-    if (destination == NULL || offset > entry.length || bytes > entry.length - offset)
+    if (mappedFile_.get() == NULL || destination == NULL || offset > entry.length || bytes > entry.length - offset)
         throw std::runtime_error("Invalid read range for DDLM tensor " + name);
-    std::ifstream file(path_.c_str(), std::ios::binary);
-    if (!file) throw std::runtime_error("Failed to reopen DDLM model");
-    file.seekg(static_cast<std::streamoff>(entry.offset + offset), std::ios::beg);
-    if (bytes && !file.read(reinterpret_cast<char *>(destination), static_cast<std::streamsize>(bytes)))
-        throw std::runtime_error("Cannot read DDLM tensor " + name);
+    const std::uint64_t sourceOffset = entry.offset + offset;
+    if (sourceOffset > mappedFile_->size || bytes > mappedFile_->size - sourceOffset)
+        throw std::runtime_error("Mapped DDLM tensor range is invalid: " + name);
+    if (bytes != 0u)
+        std::memcpy(destination,
+            static_cast<const NnByte *>(mappedFile_->data) + sourceOffset, bytes);
 }
 
 void DiffusionGemmaModelFile::validateManifest() const {

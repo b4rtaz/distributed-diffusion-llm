@@ -907,39 +907,65 @@ static inline float q40Value(const NnBlockQ40 *row, const NnUint index) {
 }
 
 static void embeddingMixLocalSum_F32(
-    float *output,
-    const float *logits,
+    NnByte **outputRows,
+    NnByte **logitRows,
     const NnByte *embedding,
     const NnFloatType embeddingType,
     const NnUint vocabSize,
     const NnUint hiddenSize,
-    const float globalMax,
-    const NnUint nThreads,
-    const NnUint threadIndex,
+    const NnUint physicalSize,
+    const float *globalMax,
+    const NnUint batchStart,
+    const NnUint batchEnd,
     const float logitScale = 1.0f)
 {
-    if (threadIndex == 0u) {
-        float denominator = 0.0f;
-        for (NnUint token = 0u; token < vocabSize; token++)
-            denominator += expf(logits[token] * logitScale - globalMax);
-        output[hiddenSize] = denominator;
+    const NnUint ownedBatches = batchEnd - batchStart;
+    if (ownedBatches == 0u)
+        return;
+    std::vector<float> probabilities(ownedBatches);
+    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+        float *output = reinterpret_cast<float *>(outputRows[batch]);
+        std::fill(output, output + physicalSize, 0.0f);
     }
 
-    SPLIT_THREADS(hiddenStart, hiddenEnd, hiddenSize, nThreads, threadIndex);
     const NnSize rowBytes = getBytes(embeddingType, hiddenSize);
-    for (NnUint h = hiddenStart; h < hiddenEnd; h++) {
-        float numerator = 0.0f;
-        for (NnUint token = 0u; token < vocabSize; token++) {
-            const float probabilityNumerator = expf(logits[token] * logitScale - globalMax);
-            if (embeddingType == F_32) {
-                const float *row = (const float *)&embedding[token * rowBytes];
-                numerator += probabilityNumerator * row[h];
-            } else {
-                const NnBlockQ40 *row = (const NnBlockQ40 *)&embedding[token * rowBytes];
-                numerator += probabilityNumerator * q40Value(row, h);
+    for (NnUint token = 0u; token < vocabSize; ++token) {
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            const float *logits = reinterpret_cast<const float *>(logitRows[batch]);
+            const float probability = expf(logits[token] * logitScale - globalMax[batch]);
+            probabilities[batch - batchStart] = probability;
+            reinterpret_cast<float *>(outputRows[batch])[hiddenSize] += probability;
+        }
+
+        if (embeddingType == F_32) {
+            const float *row = reinterpret_cast<const float *>(&embedding[token * rowBytes]);
+            for (NnUint h = 0u; h < hiddenSize; ++h) {
+                const float value = row[h];
+                for (NnUint batch = batchStart; batch < batchEnd; ++batch)
+                    reinterpret_cast<float *>(outputRows[batch])[h] +=
+                        probabilities[batch - batchStart] * value;
+            }
+        } else {
+            assert(hiddenSize % Q40_BLOCK_SIZE == 0u);
+            const NnBlockQ40 *row = reinterpret_cast<const NnBlockQ40 *>(&embedding[token * rowBytes]);
+            const NnUint nBlocks = hiddenSize / Q40_BLOCK_SIZE;
+            for (NnUint blockIndex = 0u; blockIndex < nBlocks; ++blockIndex) {
+                const NnBlockQ40 *block = &row[blockIndex];
+                const float scale = CONVERT_F16_TO_F32(block->d);
+                const NnUint blockStart = blockIndex * Q40_BLOCK_SIZE;
+                for (NnUint packedIndex = 0u; packedIndex < Q40_BLOCK_SIZE / 2u; ++packedIndex) {
+                    const NnUint packed = block->qs[packedIndex];
+                    const float low = scale * static_cast<float>((int)(packed & 0x0fu) - 8);
+                    const float high = scale * static_cast<float>((int)(packed >> 4u) - 8);
+                    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+                        float *output = reinterpret_cast<float *>(outputRows[batch]);
+                        const float probability = probabilities[batch - batchStart];
+                        output[blockStart + packedIndex] += probability * low;
+                        output[blockStart + packedIndex + Q40_BLOCK_SIZE / 2u] += probability * high;
+                    }
+                }
             }
         }
-        output[h] = numerator;
     }
 }
 
@@ -1726,6 +1752,23 @@ static void embeddingMixForward(
             throw std::runtime_error("EMBEDDING_MIX temperature must be finite and positive");
         logitScale = 1.0f / temperature;
     }
+    if (config->mode == EMBEDDING_MIX_LOCAL_SUM) {
+        const float *globalMax = (const float *)context->buffers[config->globalMaxBufferIndex];
+        SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
+        embeddingMixLocalSum_F32(
+            context->output,
+            context->input,
+            context->weight,
+            context->weightSize.floatType,
+            context->weightSize.y,
+            context->weightSize.x,
+            context->outputSize.x,
+            globalMax,
+            batchStart,
+            batchEnd,
+            logitScale);
+        return;
+    }
     for (NnUint batchIndex = 0u; batchIndex < batchSize; batchIndex++) {
         const float *input = (const float *)context->input[batchIndex];
         float *output = (float *)context->output[batchIndex];
@@ -1735,22 +1778,6 @@ static void embeddingMixForward(
         } else if (config->mode == EMBEDDING_MIX_GLOBAL_MAX) {
             if (threadIndex == 0u)
                 output[0] = *std::max_element(input, input + context->inputSize.x);
-        } else if (config->mode == EMBEDDING_MIX_LOCAL_SUM) {
-            const float *globalMax = (const float *)context->buffers[config->globalMaxBufferIndex];
-            embeddingMixLocalSum_F32(
-                output,
-                input,
-                context->weight,
-                context->weightSize.floatType,
-                context->weightSize.y,
-                context->weightSize.x,
-                globalMax[batchIndex],
-                nThreads,
-                threadIndex,
-                logitScale);
-            const NnUint logicalSize = context->weightSize.x + 1u;
-            SPLIT_THREADS(padStart, padEnd, context->outputSize.x - logicalSize, nThreads, threadIndex);
-            std::fill(output + logicalSize + padStart, output + logicalSize + padEnd, 0.0f);
         } else {
             const NnUint hiddenSize = context->outputSize.x;
             const float denominator = input[hiddenSize];

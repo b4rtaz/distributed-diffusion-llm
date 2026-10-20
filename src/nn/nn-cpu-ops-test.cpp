@@ -611,38 +611,70 @@ void testDiffusionAttention() {
 void testEmbeddingMix() {
     const NnUint vocab = 3u;
     const NnUint hidden = 32u;
-    float logits[vocab] = {0.2f, 1.0f, -0.4f};
+    const NnUint physical = 40u;
+    const NnUint batches = 3u;
+    const NnUint threads = 2u;
+    float logits[batches][vocab] = {
+        {0.2f, 1.0f, -0.4f},
+        {-0.3f, 0.1f, 0.8f},
+        {1.3f, -0.2f, 0.4f}
+    };
     std::vector<float> embedding(vocab * hidden);
     for (NnUint token = 0u; token < vocab; token++)
         for (NnUint h = 0u; h < hidden; h++)
             embedding[token * hidden + h] = (float)(token + 1u) * 0.1f + (float)h * 0.001f;
 
-    const float maxLogit = 1.0f;
-    float partial[hidden + 1u];
-    embeddingMixLocalSum_F32(partial, logits, (const NnByte *)embedding.data(), F_32,
-        vocab, hidden, maxLogit, 1u, 0u);
-    float actual[hidden];
-    for (NnUint h = 0u; h < hidden; h++)
-        actual[h] = partial[h] * 2.0f / partial[hidden];
-
-    float probabilities[vocab];
-    std::memcpy(probabilities, logits, sizeof(logits));
-    softmax_F32(probabilities, vocab);
-    float expected[hidden];
-    for (NnUint h = 0u; h < hidden; h++) {
-        expected[h] = 0.0f;
-        for (NnUint token = 0u; token < vocab; token++)
-            expected[h] += probabilities[token] * embedding[token * hidden + h] * 2.0f;
+    float maxima[batches];
+    float expected[batches][hidden];
+    for (NnUint batch = 0u; batch < batches; ++batch) {
+        maxima[batch] = *std::max_element(logits[batch], logits[batch] + vocab);
+        float probabilities[vocab];
+        std::memcpy(probabilities, logits[batch], sizeof(probabilities));
+        softmax_F32(probabilities, vocab);
+        for (NnUint h = 0u; h < hidden; ++h) {
+            expected[batch][h] = 0.0f;
+            for (NnUint token = 0u; token < vocab; ++token)
+                expected[batch][h] += probabilities[token] * embedding[token * hidden + h] * 2.0f;
+        }
     }
-    compare_F32("embeddingMixF32", actual, expected, hidden, 0.00001f);
+
+    NnByte *logitRows[batches];
+    float partial[batches][physical];
+    NnByte *partialRows[batches];
+    for (NnUint batch = 0u; batch < batches; ++batch) {
+        logitRows[batch] = reinterpret_cast<NnByte *>(logits[batch]);
+        partialRows[batch] = reinterpret_cast<NnByte *>(partial[batch]);
+        std::fill(partial[batch], partial[batch] + physical, -1.0f);
+    }
+
+    const auto run = [&](const NnByte *weights, NnFloatType type) {
+        for (NnUint thread = 0u; thread < threads; ++thread) {
+            SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
+            embeddingMixLocalSum_F32(partialRows, logitRows, weights, type,
+                vocab, hidden, physical, maxima, batchStart, batchEnd);
+        }
+    };
+
+    run(reinterpret_cast<const NnByte *>(embedding.data()), F_32);
+    float actual[batches][hidden];
+    for (NnUint batch = 0u; batch < batches; ++batch) {
+        for (NnUint h = 0u; h < hidden; ++h)
+            actual[batch][h] = partial[batch][h] * 2.0f / partial[batch][hidden];
+        compare_F32("embeddingMixF32", actual[batch], expected[batch], hidden, 0.00001f);
+        for (NnUint h = hidden + 1u; h < physical; ++h)
+            assert(partial[batch][h] == 0.0f);
+    }
 
     std::vector<NnBlockQ40> quantized(vocab * hidden / Q40_BLOCK_SIZE);
     quantizeF32toQ40(embedding.data(), quantized.data(), vocab * hidden, 1u, 0u);
-    embeddingMixLocalSum_F32(partial, logits, (const NnByte *)quantized.data(), F_Q40,
-        vocab, hidden, maxLogit, 1u, 0u);
-    for (NnUint h = 0u; h < hidden; h++)
-        actual[h] = partial[h] * 2.0f / partial[hidden];
-    compare_F32("embeddingMixQ40", actual, expected, hidden, 0.03f);
+    run(reinterpret_cast<const NnByte *>(quantized.data()), F_Q40);
+    for (NnUint batch = 0u; batch < batches; ++batch) {
+        for (NnUint h = 0u; h < hidden; ++h)
+            actual[batch][h] = partial[batch][h] * 2.0f / partial[batch][hidden];
+        compare_F32("embeddingMixQ40", actual[batch], expected[batch], hidden, 0.03f);
+        for (NnUint h = hidden + 1u; h < physical; ++h)
+            assert(partial[batch][h] == 0.0f);
+    }
 }
 
 void testPaddedShards() {
