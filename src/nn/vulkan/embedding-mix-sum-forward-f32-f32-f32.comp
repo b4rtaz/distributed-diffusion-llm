@@ -19,10 +19,15 @@ layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHE
 layout(binding = 3) readonly buffer weightBuffer { float embedding[]; };
 layout(binding = 4) readonly uniform configBuffer {
     uint mode;
+    uint embeddingMixBufferIndex;
+    uint vocabularyMaxPipeIndex;
     uint globalMaxBufferIndex;
-    float embeddingScale;
-    uint physicalSize;
     uint temperaturePipeIndex;
+    uint nodeIndex;
+    uint nNodes;
+    uint physicalSize;
+    float embeddingScale;
+    float logitSoftcap;
     uint useTemperature;
 };
 layout(binding = 5) readonly buffer globalMaxBuffer { float globalMax[]; };

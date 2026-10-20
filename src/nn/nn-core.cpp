@@ -89,7 +89,7 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_SOFTMAX) return "SOFTMAX";
     if (code == OP_MOE_GATE) return "MOE_GATE";
     if (code == OP_DIFFUSION_ATTENTION) return "DIFFUSION_ATTENTION";
-    if (code == OP_EMBEDDING_MIX) return "EMBEDDING_MIX";
+    if (code == OP_TIED_EMBEDDING) return "TIED_EMBEDDING";
     if (code == OP_TANH) return "TANH";
     if (code == OP_VOCAB_STATS) return "VOCAB_STATS";
     throw std::invalid_argument("Unknown op code: " + std::to_string(code));

@@ -96,7 +96,7 @@ enum NnOpCode {
     OP_SOFTMAX,
     OP_MOE_GATE,
     OP_DIFFUSION_ATTENTION,
-    OP_EMBEDDING_MIX,
+    OP_TIED_EMBEDDING,
     OP_TANH,
     OP_VOCAB_STATS,
     OP_COUNT,
@@ -348,21 +348,28 @@ typedef struct {
     NnUint valueCacheBufferIndex;
 } NnDiffusionAttentionOpConfig;
 
-enum NnEmbeddingMixMode {
-    EMBEDDING_MIX_LOCAL_MAX = 0,
-    EMBEDDING_MIX_LOCAL_SUM = 1,
-    EMBEDDING_MIX_FINALIZE = 2,
-    EMBEDDING_MIX_GLOBAL_MAX = 3,
+enum NnTiedEmbeddingMode {
+    TIED_EMBEDDING_LOCAL = 0,
+    TIED_EMBEDDING_RESCALE = 1,
+    TIED_EMBEDDING_FINALIZE = 2,
+    TIED_EMBEDDING_LOCAL_MAX = 3,
+    TIED_EMBEDDING_LOCAL_SUM = 4,
+    TIED_EMBEDDING_GLOBAL_MAX = 5,
 };
 
 typedef struct {
-    NnEmbeddingMixMode mode;
+    NnTiedEmbeddingMode mode;
+    NnUint embeddingMixBufferIndex;
+    NnUint vocabularyMaxPipeIndex;
     NnUint globalMaxBufferIndex;
-    float embeddingScale;
-    NnUint physicalSize; // zero means hidden size + denominator
     NnUint temperaturePipeIndex;
+    NnUint nodeIndex;
+    NnUint nNodes;
+    NnUint physicalSize;
+    float embeddingScale;
+    float logitSoftcap;
     NnUint useTemperature;
-} NnEmbeddingMixOpConfig;
+} NnTiedEmbeddingOpConfig;
 
 #define NN_VOCAB_STATS_WIDTH 5u
 #define NN_VOCAB_MICROSHARDS 8u

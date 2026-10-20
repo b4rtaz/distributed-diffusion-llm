@@ -649,11 +649,11 @@ void testEmbeddingMixMax_F32_F32() {
             const NnUint temperaturePipeIndex = netBuilder->addPipe("temperature", size1D(F_32, 1u));
             const NnUint maximumPipeIndex = netBuilder->addPipe("maximum", size2D(F_32, N_BATCHES, 1u));
             netBuilder->addPreSync(temperaturePipeIndex);
-            segmentBuilder->addOp(OP_EMBEDDING_MIX, "embedding_mix_max", 0u,
+            segmentBuilder->addOp(OP_TIED_EMBEDDING, "embedding_mix_max", 0u,
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 pointerBatchConfig(SRC_PIPE, maximumPipeIndex), size0(),
-                NnEmbeddingMixOpConfig{EMBEDDING_MIX_LOCAL_MAX, 0u, 1.0f, 0u,
-                    temperaturePipeIndex, 1u});
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_MAX, 0u, 0u, 0u,
+                    temperaturePipeIndex, 0u, 1u, 0u, 1.0f, 0.0f, 1u});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *) {
             execution->setBatchSize(2u);
@@ -682,17 +682,19 @@ void testEmbeddingMixSum_F32() {
             const NnUint globalMaxBufferIndex = nodeBuilder->addBuffer("global_max", size2D(F_32, N_BATCHES, 1u));
             const NnUint localSumBufferIndex = nodeBuilder->addBuffer("local_sum",
                 size2D(F_32, N_BATCHES, EMBEDDING_MIX_PHYSICAL));
-            segmentBuilder->addOp(OP_EMBEDDING_MIX, "embedding_mix_weight", 0u,
+            segmentBuilder->addOp(OP_TIED_EMBEDDING, "embedding_mix_weight", 0u,
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 pointerBatchConfig(SRC_BUFFER, localSumBufferIndex),
                 size2D(quantized ? F_Q40 : F_32, EMBEDDING_MIX_VOCAB, EMBEDDING_MIX_HIDDEN),
-                NnEmbeddingMixOpConfig{EMBEDDING_MIX_LOCAL_SUM, globalMaxBufferIndex, 1.0f,
-                    EMBEDDING_MIX_PHYSICAL, temperaturePipeIndex, 1u});
-            segmentBuilder->addOp(OP_EMBEDDING_MIX, "embedding_mix_finalize", 0u,
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_SUM, 0u, 0u,
+                    globalMaxBufferIndex, temperaturePipeIndex, 0u, 1u,
+                    EMBEDDING_MIX_PHYSICAL, 1.0f, 0.0f, 1u});
+            segmentBuilder->addOp(OP_TIED_EMBEDDING, "embedding_mix_finalize", 0u,
                 pointerBatchConfig(SRC_BUFFER, localSumBufferIndex),
                 pointerBatchConfig(SRC_PIPE, outputPipeIndex), size0(),
-                NnEmbeddingMixOpConfig{EMBEDDING_MIX_FINALIZE, 0u, 2.0f,
-                    EMBEDDING_MIX_PHYSICAL, temperaturePipeIndex, 0u});
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_FINALIZE, 0u, 0u, 0u,
+                    temperaturePipeIndex, 0u, 1u, EMBEDDING_MIX_PHYSICAL,
+                    2.0f, 0.0f, 0u});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             const NnUint batchSize = 2u;

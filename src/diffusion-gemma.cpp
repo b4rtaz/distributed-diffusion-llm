@@ -575,6 +575,15 @@ struct NodeBuilder {
     void addLogitsSegment(bool decoder) {
         NnSegmentConfigBuilder s;
         castForMatmul(s, x, quantHidden, decoder ? "decoder.quantize_logits" : "encoder.quantize_logits");
+#if defined(DLLAMA_VULKAN)
+        const bool useTiedEmbedding = false;
+#else
+        const bool useTiedEmbedding = decoder;
+#endif
+        if (useTiedEmbedding) {
+            node.addSegment(s.build());
+            return;
+        }
         s.addOp(OP_MATMUL, "token_embedding.weight", 0u,
             pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
             size2D(weightType, h.hiddenSize, localVocab()), embeddingWeight,
@@ -590,12 +599,26 @@ struct NodeBuilder {
         node.addSegment(s.build());
     }
 
-    void addVocabularyMaxSegment() {
+    void addVocabularyMaxSegment(bool decoder) {
         NnSegmentConfigBuilder maxima;
-        maxima.addOp(OP_EMBEDDING_MIX, "embedding_mix.local_max", 0u,
+#if !defined(DLLAMA_VULKAN)
+        if (decoder) {
+            const NnUint mixWidth = ((h.hiddenSize + 1u + 31u) / 32u) * 32u;
+            maxima.addOp(OP_TIED_EMBEDDING, "token_embedding.weight", 0u,
+                pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
+                size2D(weightType, localVocab(), h.hiddenSize), embeddingWeight,
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL, localEmbeddingMix,
+                    pipes.vocabularyMaxSync, 0u, pipes.temperature, nodeIndex, nNodes, mixWidth,
+                    1.0f, h.logitSoftcap, 1u});
+            maxima.addSync(pipes.vocabularyMaxSync, SYNC_NODE_SLICES);
+            node.addSegment(maxima.build());
+            return;
+        }
+#endif
+        maxima.addOp(OP_TIED_EMBEDDING, "embedding_mix.local_max", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync),
-            size0(), NnEmbeddingMixOpConfig{EMBEDDING_MIX_LOCAL_MAX, 0u, 1.0f, 0u,
-                pipes.temperature, 1u});
+            size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_MAX, 0u, 0u,
+                0u, pipes.temperature, nodeIndex, nNodes, 0u, 1.0f, 0.0f, 1u});
         maxima.addSync(pipes.vocabularyMaxSync, SYNC_NODE_SLICES);
         node.addSegment(maxima.build());
     }
@@ -603,16 +626,25 @@ struct NodeBuilder {
     void addVocabularyStatsSegment(bool decoder) {
         const NnUint mixWidth = ((h.hiddenSize + 1u + 31u) / 32u) * 32u;
         NnSegmentConfigBuilder sum;
-        sum.addOp(OP_EMBEDDING_MIX, "embedding_mix.global_max", 0u,
+        sum.addOp(OP_TIED_EMBEDDING, "embedding_mix.global_max", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.vocabularyMaxSync), pointerBatchConfig(SRC_BUFFER, globalVocabularyMax),
-            size0(), NnEmbeddingMixOpConfig{EMBEDDING_MIX_GLOBAL_MAX, 0u, 1.0f, 0u,
-                pipes.temperature, 0u});
+            size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_GLOBAL_MAX, 0u, 0u,
+                0u, pipes.temperature, nodeIndex, nNodes, 0u, 1.0f, 0.0f, 0u});
         if (decoder) {
-            sum.addOp(OP_EMBEDDING_MIX, "token_embedding.weight", 0u,
+#if defined(DLLAMA_VULKAN)
+            sum.addOp(OP_TIED_EMBEDDING, "token_embedding.weight", 0u,
                 pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_BUFFER, localEmbeddingMix),
                 size2D(weightType, localVocab(), h.hiddenSize), embeddingWeight,
-                NnEmbeddingMixOpConfig{EMBEDDING_MIX_LOCAL_SUM, globalVocabularyMax, 1.0f, mixWidth,
-                    pipes.temperature, 1u});
+                NnTiedEmbeddingOpConfig{TIED_EMBEDDING_LOCAL_SUM, 0u, 0u,
+                    globalVocabularyMax, pipes.temperature, nodeIndex, nNodes, mixWidth,
+                    1.0f, 0.0f, 1u});
+#else
+            sum.addOp(OP_TIED_EMBEDDING, "embedding_mix.rescale", 0u,
+                pointerBatchConfig(SRC_BUFFER, localEmbeddingMix), pointerBatchConfig(SRC_BUFFER, localEmbeddingMix),
+                size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_RESCALE, 0u,
+                    pipes.vocabularyMaxSync, globalVocabularyMax, 0u, nodeIndex, nNodes, mixWidth,
+                    1.0f, 0.0f, 0u});
+#endif
             sum.addOp(OP_CAST, "embedding_mix.pack", 0u,
                 pointerBatchConfig(SRC_BUFFER, localEmbeddingMix), pointerBatchedSliceConfig(SRC_PIPE, pipes.embeddingMixSync),
                 size0(), NnCastOpCodeConfig{});
@@ -634,10 +666,17 @@ struct NodeBuilder {
         finalize.addOp(OP_MERGE_SUM, "embedding_mix.reduce", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.embeddingMixSync), pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix),
             size0(), NnMergeSumOpCodeConfig{1u});
-        finalize.addOp(OP_EMBEDDING_MIX, "embedding_mix.finalize", 0u,
+#if defined(DLLAMA_VULKAN)
+        finalize.addOp(OP_TIED_EMBEDDING, "embedding_mix.finalize", 0u,
             pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix), pointerBatchConfig(SRC_PIPE, pipes.selfConditioning),
-            size0(), NnEmbeddingMixOpConfig{EMBEDDING_MIX_FINALIZE, 0u, h.embeddingScale, mixWidth,
-                pipes.temperature, 0u});
+            size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_FINALIZE, 0u, 0u,
+                0u, pipes.temperature, nodeIndex, nNodes, mixWidth, h.embeddingScale, 0.0f, 0u});
+#else
+        finalize.addOp(OP_TIED_EMBEDDING, "embedding_mix.finalize", 0u,
+            pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix), pointerBatchConfig(SRC_PIPE, pipes.selfConditioning),
+            size0(), NnTiedEmbeddingOpConfig{TIED_EMBEDDING_FINALIZE, 0u,
+                0u, 0u, 0u, nodeIndex, nNodes, mixWidth, h.embeddingScale, 0.0f, 0u});
+#endif
         finalize.addOp(OP_VOCAB_STATS, "sampler.sample", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.samplerStatsSync), pointerBatchedSliceConfig(SRC_PIPE, pipes.sampledTokensSync),
             size0(), NnVocabStatsOpConfig{VOCAB_STATS_SAMPLE, globalVocabularyMax, pipes.temperature,
@@ -656,7 +695,7 @@ struct NodeBuilder {
         }
         addFinalSegment(decoder);
         addLogitsSegment(decoder);
-        addVocabularyMaxSegment();
+        addVocabularyMaxSegment(decoder);
         addVocabularyStatsSegment(decoder);
         if (decoder)
             addEmbeddingMixFinalizeSegment();

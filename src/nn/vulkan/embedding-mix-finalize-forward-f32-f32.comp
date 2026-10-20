@@ -18,10 +18,15 @@ layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
 layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
 layout(binding = 3) readonly uniform configBuffer {
     uint mode;
+    uint embeddingMixBufferIndex;
+    uint vocabularyMaxPipeIndex;
     uint globalMaxBufferIndex;
-    float embeddingScale;
-    uint physicalSize;
     uint temperaturePipeIndex;
+    uint nodeIndex;
+    uint nNodes;
+    uint physicalSize;
+    float embeddingScale;
+    float logitSoftcap;
     uint useTemperature;
 };
 

@@ -895,15 +895,200 @@ static void diffusionAttention_F32(
     }
 }
 
-static inline float q40Value(const NnBlockQ40 *row, const NnUint index) {
-    const NnBlockQ40 *block = &row[index / Q40_BLOCK_SIZE];
-    const NnUint i = index % Q40_BLOCK_SIZE;
-    const NnUint packedIndex = i % (Q40_BLOCK_SIZE / 2u);
-    const NnUint packed = block->qs[packedIndex];
-    const int quant = i < Q40_BLOCK_SIZE / 2u
-        ? (int)(packed & 0x0fu) - 8
-        : (int)(packed >> 4u) - 8;
-    return CONVERT_F16_TO_F32(block->d) * (float)quant;
+static inline void dequantizeQ40Block_F32(
+    const NnBlockQ40 *block,
+    float *output,
+    const float scale = 1.0f);
+
+static void weightedAccumulate_F32(
+    float *output,
+    const float *value,
+    const NnUint size,
+    const float outputScale,
+    const float valueScale)
+{
+    NnUint i = 0u;
+#if defined(__ARM_NEON)
+    const float32x4_t outputScaleVec = vdupq_n_f32(outputScale);
+    const float32x4_t valueScaleVec = vdupq_n_f32(valueScale);
+    for (; i + 4u <= size; i += 4u) {
+        float32x4_t out = vld1q_f32(output + i);
+        const float32x4_t row = vld1q_f32(value + i);
+        if (outputScale != 1.0f)
+            out = vmulq_f32(out, outputScaleVec);
+        out = vfmaq_f32(out, row, valueScaleVec);
+        vst1q_f32(output + i, out);
+    }
+#elif defined(__AVX2__)
+    const __m256 outputScaleVec = _mm256_set1_ps(outputScale);
+    const __m256 valueScaleVec = _mm256_set1_ps(valueScale);
+    for (; i + 8u <= size; i += 8u) {
+        __m256 out = _mm256_loadu_ps(output + i);
+        const __m256 row = _mm256_loadu_ps(value + i);
+        if (outputScale != 1.0f)
+            out = _mm256_mul_ps(out, outputScaleVec);
+        out = _mm256_fmadd_ps(row, valueScaleVec, out);
+        _mm256_storeu_ps(output + i, out);
+    }
+#endif
+    for (; i < size; ++i)
+        output[i] = output[i] * outputScale + value[i] * valueScale;
+}
+
+static void tiedEmbeddingLocal_F32_F32_F32(
+    NnByte **logitRows,
+    NnByte **hiddenRows,
+    const float *embedding,
+    float *embeddingMix,
+    float *vocabularyMax,
+    const NnUint vocabSize,
+    const NnUint hiddenSize,
+    const NnUint physicalSize,
+    const NnUint nodeIndex,
+    const NnUint nNodes,
+    const float inverseTemperature,
+    const float logitSoftcap,
+    const NnUint batchStart,
+    const NnUint batchEnd)
+{
+    const NnUint ownedBatches = batchEnd - batchStart;
+    std::vector<float> runningMax(ownedBatches);
+    std::vector<float> denominator(ownedBatches);
+    std::vector<float> outputScale(ownedBatches);
+    std::vector<float> valueScale(ownedBatches);
+
+    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+        float *mix = embeddingMix + batch * physicalSize;
+        std::fill(mix, mix + physicalSize, 0.0f);
+    }
+
+    for (NnUint token = 0u; token < vocabSize; ++token) {
+        const float *row = embedding + token * hiddenSize;
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            const NnUint ownedBatch = batch - batchStart;
+            const float *hidden = reinterpret_cast<const float *>(hiddenRows[batch]);
+            const float rawLogit = dotProduct_F32(hidden, row, hiddenSize);
+            const float logit = logitSoftcap * tanhf(rawLogit / logitSoftcap);
+            reinterpret_cast<float *>(logitRows[batch])[token] = logit;
+            const float score = logit * inverseTemperature;
+            if (token == 0u) {
+                runningMax[ownedBatch] = score;
+                denominator[ownedBatch] = 1.0f;
+                outputScale[ownedBatch] = 0.0f;
+                valueScale[ownedBatch] = 1.0f;
+            } else if (score > runningMax[ownedBatch]) {
+                const float scale = expf(runningMax[ownedBatch] - score);
+                runningMax[ownedBatch] = score;
+                denominator[ownedBatch] = denominator[ownedBatch] * scale + 1.0f;
+                outputScale[ownedBatch] = scale;
+                valueScale[ownedBatch] = 1.0f;
+            } else {
+                const float scale = expf(score - runningMax[ownedBatch]);
+                denominator[ownedBatch] += scale;
+                outputScale[ownedBatch] = 1.0f;
+                valueScale[ownedBatch] = scale;
+            }
+        }
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            const NnUint ownedBatch = batch - batchStart;
+            weightedAccumulate_F32(
+                embeddingMix + batch * physicalSize,
+                row,
+                hiddenSize,
+                outputScale[ownedBatch],
+                valueScale[ownedBatch]);
+        }
+    }
+
+    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+        const NnUint ownedBatch = batch - batchStart;
+        embeddingMix[batch * physicalSize + hiddenSize] = denominator[ownedBatch];
+        vocabularyMax[batch * nNodes + nodeIndex] = runningMax[ownedBatch];
+    }
+}
+
+static void tiedEmbeddingLocal_Q80_Q40_F32(
+    NnByte **logitRows,
+    NnByte **hiddenRows,
+    const NnBlockQ40 *embedding,
+    float *embeddingMix,
+    float *vocabularyMax,
+    const NnUint vocabSize,
+    const NnUint hiddenSize,
+    const NnUint physicalSize,
+    const NnUint nodeIndex,
+    const NnUint nNodes,
+    const float inverseTemperature,
+    const float logitSoftcap,
+    const NnUint batchStart,
+    const NnUint batchEnd)
+{
+    const NnUint ownedBatches = batchEnd - batchStart;
+    const NnUint rowBlocks = hiddenSize / Q40_BLOCK_SIZE;
+    std::vector<float> row(hiddenSize);
+    std::vector<float> runningMax(ownedBatches);
+    std::vector<float> denominator(ownedBatches);
+    std::vector<float> outputScale(ownedBatches);
+    std::vector<float> valueScale(ownedBatches);
+
+    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+        float *mix = embeddingMix + batch * physicalSize;
+        std::fill(mix, mix + physicalSize, 0.0f);
+    }
+
+    for (NnUint token = 0u; token < vocabSize; ++token) {
+        const NnBlockQ40 *quantizedRow = embedding + token * rowBlocks;
+        for (NnUint block = 0u; block < rowBlocks; ++block)
+            dequantizeQ40Block_F32(
+                &quantizedRow[block], row.data() + block * Q40_BLOCK_SIZE);
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            const NnUint ownedBatch = batch - batchStart;
+            float rawLogit;
+            matmul_Q80_Q40_F32(
+                &rawLogit,
+                reinterpret_cast<const NnBlockQ80 *>(hiddenRows[batch]),
+                quantizedRow,
+                hiddenSize,
+                1u,
+                1u,
+                0u);
+            const float logit = logitSoftcap * tanhf(rawLogit / logitSoftcap);
+            reinterpret_cast<float *>(logitRows[batch])[token] = logit;
+            const float score = logit * inverseTemperature;
+            if (token == 0u) {
+                runningMax[ownedBatch] = score;
+                denominator[ownedBatch] = 1.0f;
+                outputScale[ownedBatch] = 0.0f;
+                valueScale[ownedBatch] = 1.0f;
+            } else if (score > runningMax[ownedBatch]) {
+                const float scale = expf(runningMax[ownedBatch] - score);
+                runningMax[ownedBatch] = score;
+                denominator[ownedBatch] = denominator[ownedBatch] * scale + 1.0f;
+                outputScale[ownedBatch] = scale;
+                valueScale[ownedBatch] = 1.0f;
+            } else {
+                const float scale = expf(score - runningMax[ownedBatch]);
+                denominator[ownedBatch] += scale;
+                outputScale[ownedBatch] = 1.0f;
+                valueScale[ownedBatch] = scale;
+            }
+        }
+        for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+            const NnUint ownedBatch = batch - batchStart;
+            weightedAccumulate_F32(
+                embeddingMix + batch * physicalSize,
+                row.data(),
+                hiddenSize,
+                outputScale[ownedBatch],
+                valueScale[ownedBatch]);
+        }
+    }
+
+    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+        const NnUint ownedBatch = batch - batchStart;
+        embeddingMix[batch * physicalSize + hiddenSize] = denominator[ownedBatch];
+        vocabularyMax[batch * nNodes + nodeIndex] = runningMax[ownedBatch];
+    }
 }
 
 static void embeddingMixLocalSum_F32(
@@ -1205,6 +1390,68 @@ static inline float q80Value(const NnBlockQ80 *input, const NnUint index) {
     return CONVERT_F16_TO_F32(block->d) * block->qs[index % Q80_BLOCK_SIZE];
 }
 
+static inline void dequantizeQ40Block_F32(
+    const NnBlockQ40 *block,
+    float *output,
+    const float scale)
+{
+    const float blockScale = CONVERT_F16_TO_F32(block->d) * scale;
+#if defined(__ARM_NEON)
+    const uint8x16_t packed = vld1q_u8(block->qs);
+    const int8x16_t offset = vdupq_n_s8(8);
+    const int8x16_t low = vsubq_s8(
+        vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(0x0fu))), offset);
+    const int8x16_t high = vsubq_s8(
+        vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), offset);
+    const float32x4_t blockScaleVec = vdupq_n_f32(blockScale);
+    const int16x8_t low0 = vmovl_s8(vget_low_s8(low));
+    const int16x8_t low1 = vmovl_s8(vget_high_s8(low));
+    const int16x8_t high0 = vmovl_s8(vget_low_s8(high));
+    const int16x8_t high1 = vmovl_s8(vget_high_s8(high));
+    vst1q_f32(output,
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(low0))), blockScaleVec));
+    vst1q_f32(output + 4u,
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(low0))), blockScaleVec));
+    vst1q_f32(output + 8u,
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(low1))), blockScaleVec));
+    vst1q_f32(output + 12u,
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(low1))), blockScaleVec));
+    vst1q_f32(output + 16u,
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(high0))), blockScaleVec));
+    vst1q_f32(output + 20u,
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(high0))), blockScaleVec));
+    vst1q_f32(output + 24u,
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(high1))), blockScaleVec));
+    vst1q_f32(output + 28u,
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(high1))), blockScaleVec));
+#elif defined(__AVX2__)
+    const __m128i packed = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block->qs));
+    const __m128i low = _mm_sub_epi8(
+        _mm_and_si128(packed, _mm_set1_epi8(0x0f)), _mm_set1_epi8(8));
+    const __m128i high = _mm_sub_epi8(
+        _mm_and_si128(_mm_srli_epi16(packed, 4), _mm_set1_epi8(0x0f)),
+        _mm_set1_epi8(8));
+    const __m256 blockScaleVec = _mm256_set1_ps(blockScale);
+    _mm256_storeu_ps(output,
+        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low)), blockScaleVec));
+    _mm256_storeu_ps(output + 8u,
+        _mm256_mul_ps(_mm256_cvtepi32_ps(
+            _mm256_cvtepi8_epi32(_mm_srli_si128(low, 8))), blockScaleVec));
+    _mm256_storeu_ps(output + 16u,
+        _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high)), blockScaleVec));
+    _mm256_storeu_ps(output + 24u,
+        _mm256_mul_ps(_mm256_cvtepi32_ps(
+            _mm256_cvtepi8_epi32(_mm_srli_si128(high, 8))), blockScaleVec));
+#else
+    for (NnUint packedIndex = 0u; packedIndex < Q40_BLOCK_SIZE / 2u; ++packedIndex) {
+        const NnUint packed = block->qs[packedIndex];
+        output[packedIndex] = blockScale * (float)((int)(packed & 0x0fu) - 8);
+        output[packedIndex + Q40_BLOCK_SIZE / 2u] =
+            blockScale * (float)((int)(packed >> 4u) - 8);
+    }
+#endif
+}
+
 static void mergeSumForward_Q80_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     ASSERT_EQ(context->inputSize.floatType, F_Q80);
     ASSERT_EQ(context->outputSize.floatType, F_32);
@@ -1303,8 +1550,7 @@ static void embeddingForward_F32_Q40_F32(NnUint nThreads, NnUint threadIndex, Nn
             SPLIT_THREADS(blockStart, blockEnd, nBlocks, nThreads, threadIndex);
             for (NnUint block = blockStart; block < blockEnd; ++block) {
                 const NnUint start = block * Q40_BLOCK_SIZE;
-                for (NnUint i = 0u; i < Q40_BLOCK_SIZE; ++i)
-                    output[start + i] = q40Value(row, start + i) * scale;
+                dequantizeQ40Block_F32(&row[block], output + start, scale);
             }
         }
     }
@@ -1702,8 +1948,189 @@ static void diffusionAttentionForward_F32_F32(
         threadIndex);
 }
 
-static void initEmbeddingMixForward(NnCpuOpContext *context) {
-    const NnEmbeddingMixOpConfig *config = (NnEmbeddingMixOpConfig *)context->opConfig;
+static void initTiedEmbeddingReductionForward(NnCpuOpContext *context);
+static void tiedEmbeddingReductionForward(
+    NnUint nThreads,
+    NnUint threadIndex,
+    NnUint batchSize,
+    NnCpuOpContext *context);
+
+static void initTiedEmbeddingForward(NnCpuOpContext *context) {
+    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
+    if (config->mode == TIED_EMBEDDING_LOCAL_MAX ||
+        config->mode == TIED_EMBEDDING_LOCAL_SUM ||
+        config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
+        initTiedEmbeddingReductionForward(context);
+        return;
+    }
+    if (config->mode == TIED_EMBEDDING_LOCAL) {
+        if (context->weightSize.floatType != F_32 && context->weightSize.floatType != F_Q40)
+            throw std::invalid_argument("TIED_EMBEDDING supports F32 and Q40 embeddings");
+        if (context->inputSize.floatType != F_32 && context->inputSize.floatType != F_Q80)
+            throw std::invalid_argument("TIED_EMBEDDING supports F32 and Q80 hidden states");
+        ASSERT_EQ(context->outputSize.floatType, F_32);
+        ASSERT_EQ(context->inputSize.x, context->weightSize.x);
+        ASSERT_EQ(context->outputSize.x, context->weightSize.y);
+        ASSERT_EQ(context->inputSize.y, context->nBatches);
+        ASSERT_EQ(context->outputSize.y, context->nBatches);
+        assert(config->nNodes > 0u && config->nodeIndex < config->nNodes);
+        assert(config->logitSoftcap > 0.0f && std::isfinite(config->logitSoftcap));
+        const NnUint physicalSize = config->physicalSize == 0u
+            ? context->inputSize.x + 1u
+            : config->physicalSize;
+        assert(physicalSize >= context->inputSize.x + 1u);
+        const NnBufferConfig *mix = &context->bufferConfigs[config->embeddingMixBufferIndex];
+        ASSERT_EQ(mix->size.floatType, F_32);
+        ASSERT_EQ(mix->size.x, physicalSize);
+        ASSERT_EQ(mix->size.y, context->nBatches);
+        const NnPipeConfig *maximum = &context->pipeConfigs[config->vocabularyMaxPipeIndex];
+        ASSERT_EQ(maximum->size.floatType, F_32);
+        ASSERT_EQ(maximum->size.x, config->nNodes);
+        ASSERT_EQ(maximum->size.y, context->nBatches);
+        const NnPipeConfig *temperature = &context->pipeConfigs[config->temperaturePipeIndex];
+        ASSERT_EQ(temperature->size.floatType, F_32);
+        assert(temperature->size.length == 1u);
+        return;
+    }
+
+    ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    ASSERT_EQ(context->inputSize.y, context->nBatches);
+    ASSERT_EQ(context->outputSize.y, context->nBatches);
+    assert(context->weightSize.nBytes == 0u);
+    if (config->mode == TIED_EMBEDDING_RESCALE) {
+        ASSERT_EQ(context->inputSize.x, context->outputSize.x);
+        const NnBufferConfig *maximum = &context->bufferConfigs[config->globalMaxBufferIndex];
+        ASSERT_EQ(maximum->size.floatType, F_32);
+        ASSERT_EQ(maximum->size.x, 1u);
+        ASSERT_EQ(maximum->size.y, context->nBatches);
+        const NnPipeConfig *localMaximum = &context->pipeConfigs[config->vocabularyMaxPipeIndex];
+        ASSERT_EQ(localMaximum->size.floatType, F_32);
+        ASSERT_EQ(localMaximum->size.x, config->nNodes);
+        ASSERT_EQ(localMaximum->size.y, context->nBatches);
+        assert(config->nodeIndex < config->nNodes);
+    } else if (config->mode == TIED_EMBEDDING_FINALIZE) {
+        const NnUint physicalSize = config->physicalSize == 0u
+            ? context->outputSize.x + 1u
+            : config->physicalSize;
+        ASSERT_EQ(context->inputSize.x, physicalSize);
+        assert(physicalSize >= context->outputSize.x + 1u);
+    } else {
+        throw std::invalid_argument("TIED_EMBEDDING has an invalid mode");
+    }
+}
+
+static void tiedEmbeddingLocalForward_F32_F32_F32(
+    NnUint nThreads,
+    NnUint threadIndex,
+    NnUint batchSize,
+    NnCpuOpContext *context)
+{
+    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
+    const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
+    if (!(temperature > 0.0f) || !std::isfinite(temperature))
+        throw std::runtime_error("TIED_EMBEDDING temperature must be finite and positive");
+    SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
+    const NnUint physicalSize = config->physicalSize == 0u
+        ? context->inputSize.x + 1u
+        : config->physicalSize;
+    tiedEmbeddingLocal_F32_F32_F32(
+        context->output,
+        context->input,
+        reinterpret_cast<const float *>(context->weight),
+        reinterpret_cast<float *>(context->buffers[config->embeddingMixBufferIndex]),
+        reinterpret_cast<float *>(context->pipes[config->vocabularyMaxPipeIndex]),
+        context->weightSize.y,
+        context->weightSize.x,
+        physicalSize,
+        config->nodeIndex,
+        config->nNodes,
+        1.0f / temperature,
+        config->logitSoftcap,
+        batchStart,
+        batchEnd);
+}
+
+static void tiedEmbeddingLocalForward_Q80_Q40_F32(
+    NnUint nThreads,
+    NnUint threadIndex,
+    NnUint batchSize,
+    NnCpuOpContext *context)
+{
+    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
+    const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
+    if (!(temperature > 0.0f) || !std::isfinite(temperature))
+        throw std::runtime_error("TIED_EMBEDDING temperature must be finite and positive");
+    SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
+    const NnUint physicalSize = config->physicalSize == 0u
+        ? context->inputSize.x + 1u
+        : config->physicalSize;
+    tiedEmbeddingLocal_Q80_Q40_F32(
+        context->output,
+        context->input,
+        reinterpret_cast<const NnBlockQ40 *>(context->weight),
+        reinterpret_cast<float *>(context->buffers[config->embeddingMixBufferIndex]),
+        reinterpret_cast<float *>(context->pipes[config->vocabularyMaxPipeIndex]),
+        context->weightSize.y,
+        context->weightSize.x,
+        physicalSize,
+        config->nodeIndex,
+        config->nNodes,
+        1.0f / temperature,
+        config->logitSoftcap,
+        batchStart,
+        batchEnd);
+}
+
+static void tiedEmbeddingForward_F32_F32_F32(
+    NnUint nThreads,
+    NnUint threadIndex,
+    NnUint batchSize,
+    NnCpuOpContext *context)
+{
+    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
+    if (config->mode == TIED_EMBEDDING_LOCAL_MAX ||
+        config->mode == TIED_EMBEDDING_LOCAL_SUM ||
+        config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
+        tiedEmbeddingReductionForward(nThreads, threadIndex, batchSize, context);
+        return;
+    }
+    if (config->mode == TIED_EMBEDDING_LOCAL) {
+        tiedEmbeddingLocalForward_F32_F32_F32(nThreads, threadIndex, batchSize, context);
+        return;
+    }
+    if (config->mode == TIED_EMBEDDING_RESCALE) {
+        const float *localMaximum = reinterpret_cast<const float *>(
+            context->pipes[config->vocabularyMaxPipeIndex]);
+        const float *globalMaximum = reinterpret_cast<const float *>(
+            context->buffers[config->globalMaxBufferIndex]);
+        for (NnUint batch = 0u; batch < batchSize; ++batch) {
+            const float scale = expf(
+                localMaximum[batch * config->nNodes + config->nodeIndex] - globalMaximum[batch]);
+            const float *input = reinterpret_cast<const float *>(context->input[batch]);
+            float *output = reinterpret_cast<float *>(context->output[batch]);
+            SPLIT_THREADS(start, end, context->outputSize.x, nThreads, threadIndex);
+            for (NnUint i = start; i < end; ++i)
+                output[i] = input[i] * scale;
+        }
+        return;
+    }
+    for (NnUint batch = 0u; batch < batchSize; ++batch) {
+        const float *input = reinterpret_cast<const float *>(context->input[batch]);
+        float *output = reinterpret_cast<float *>(context->output[batch]);
+        const NnUint hiddenSize = context->outputSize.x;
+        const float denominator = input[hiddenSize];
+        if (!(denominator > 0.0f) || !std::isfinite(denominator))
+            throw std::runtime_error("TIED_EMBEDDING denominator must be finite and positive");
+        const float factor = config->embeddingScale / denominator;
+        SPLIT_THREADS(start, end, hiddenSize, nThreads, threadIndex);
+        for (NnUint h = start; h < end; ++h)
+            output[h] = input[h] * factor;
+    }
+}
+
+static void initTiedEmbeddingReductionForward(NnCpuOpContext *context) {
+    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_32);
     ASSERT_EQ(context->inputSize.y, context->nBatches);
@@ -1713,46 +2140,41 @@ static void initEmbeddingMixForward(NnCpuOpContext *context) {
         ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.y, 1u);
     }
 
-    if (config->mode == EMBEDDING_MIX_LOCAL_MAX) {
+    if (config->mode == TIED_EMBEDDING_LOCAL_MAX) {
         assert(context->weightSize.nBytes == 0u);
         ASSERT_EQ(context->outputSize.x, 1u);
-    } else if (config->mode == EMBEDDING_MIX_GLOBAL_MAX) {
+    } else if (config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
         assert(context->weightSize.nBytes == 0u);
         ASSERT_EQ(context->outputSize.x, 1u);
-    } else if (config->mode == EMBEDDING_MIX_LOCAL_SUM) {
+    } else if (config->mode == TIED_EMBEDDING_LOCAL_SUM) {
         if (context->weightSize.floatType != F_32 && context->weightSize.floatType != F_Q40)
-            throw std::invalid_argument("EMBEDDING_MIX supports F32 and Q40 embeddings");
+            throw std::invalid_argument("TIED_EMBEDDING supports F32 and Q40 embeddings");
         ASSERT_EQ(context->weightSize.y, context->inputSize.x);
         const NnUint physicalSize = config->physicalSize == 0u ? context->weightSize.x + 1u : config->physicalSize;
         ASSERT_EQ(context->outputSize.x, physicalSize);
         assert(physicalSize >= context->weightSize.x + 1u);
         if (context->weightSize.floatType == F_Q40)
             assert(context->weightSize.x % Q40_BLOCK_SIZE == 0u);
-    } else if (config->mode == EMBEDDING_MIX_FINALIZE) {
-        assert(context->weightSize.nBytes == 0u);
-        const NnUint physicalSize = config->physicalSize == 0u ? context->outputSize.x + 1u : config->physicalSize;
-        ASSERT_EQ(context->inputSize.x, physicalSize);
-        assert(physicalSize >= context->outputSize.x + 1u);
     } else {
-        throw std::invalid_argument("EMBEDDING_MIX has an invalid mode");
+        throw std::invalid_argument("TIED_EMBEDDING has an invalid reduction mode");
     }
 }
 
-static void embeddingMixForward(
+static void tiedEmbeddingReductionForward(
     NnUint nThreads,
     NnUint threadIndex,
     NnUint batchSize,
     NnCpuOpContext *context)
 {
-    const NnEmbeddingMixOpConfig *config = (NnEmbeddingMixOpConfig *)context->opConfig;
+    const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)context->opConfig;
     float logitScale = 1.0f;
     if (config->useTemperature != 0u) {
         const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
         if (!(temperature > 0.0f) || !std::isfinite(temperature))
-            throw std::runtime_error("EMBEDDING_MIX temperature must be finite and positive");
+            throw std::runtime_error("TIED_EMBEDDING temperature must be finite and positive");
         logitScale = 1.0f / temperature;
     }
-    if (config->mode == EMBEDDING_MIX_LOCAL_SUM) {
+    if (config->mode == TIED_EMBEDDING_LOCAL_SUM) {
         const float *globalMax = (const float *)context->buffers[config->globalMaxBufferIndex];
         SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
         embeddingMixLocalSum_F32(
@@ -1772,21 +2194,12 @@ static void embeddingMixForward(
     for (NnUint batchIndex = 0u; batchIndex < batchSize; batchIndex++) {
         const float *input = (const float *)context->input[batchIndex];
         float *output = (float *)context->output[batchIndex];
-        if (config->mode == EMBEDDING_MIX_LOCAL_MAX) {
+        if (config->mode == TIED_EMBEDDING_LOCAL_MAX) {
             if (threadIndex == 0u)
                 output[0] = *std::max_element(input, input + context->inputSize.x) * logitScale;
-        } else if (config->mode == EMBEDDING_MIX_GLOBAL_MAX) {
+        } else if (config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
             if (threadIndex == 0u)
                 output[0] = *std::max_element(input, input + context->inputSize.x);
-        } else {
-            const NnUint hiddenSize = context->outputSize.x;
-            const float denominator = input[hiddenSize];
-            if (!(denominator > 0.0f) || !std::isfinite(denominator))
-                throw std::runtime_error("EMBEDDING_MIX denominator must be finite and positive");
-            SPLIT_THREADS(start, end, hiddenSize, nThreads, threadIndex);
-            const float factor = config->embeddingScale / denominator;
-            for (NnUint h = start; h < end; h++)
-                output[h] = input[h] * factor;
         }
     }
 }
@@ -2249,8 +2662,8 @@ NnCpuOpForwardInit getCpuOpForwardInit(NnOpCode code, NnOpQuantType quantType) {
         return initMoeGateForward;
     if (code == OP_DIFFUSION_ATTENTION)
         return initDiffusionAttentionForward;
-    if (code == OP_EMBEDDING_MIX)
-        return initEmbeddingMixForward;
+    if (code == OP_TIED_EMBEDDING)
+        return initTiedEmbeddingForward;
     if (code == OP_VOCAB_STATS)
         return initVocabStatsForward;
     return nullptr;
@@ -2321,8 +2734,10 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     if (code == OP_DIFFUSION_ATTENTION) {
         if (quantType == F32_F32_F32) return diffusionAttentionForward_F32_F32;
     }
-    if (code == OP_EMBEDDING_MIX) {
-        if (quantType == F32_F32_F32 || quantType == F32_Q40_F32) return embeddingMixForward;
+    if (code == OP_TIED_EMBEDDING) {
+        if (quantType == F32_F32_F32) return tiedEmbeddingForward_F32_F32_F32;
+        if (quantType == F32_Q40_F32) return tiedEmbeddingReductionForward;
+        if (quantType == Q80_Q40_F32) return tiedEmbeddingLocalForward_Q80_Q40_F32;
     }
     if (code == OP_VOCAB_STATS && quantType == F32_F32_F32)
         return vocabStatsForward;

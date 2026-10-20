@@ -572,16 +572,16 @@ static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuant
     if (opCode == OP_DIFFUSION_ATTENTION) {
         if (quantType == F32_F32_F32) return "diffusion-attention-forward-f32-f32.spv";
     }
-    if (opCode == OP_EMBEDDING_MIX) {
-        const NnEmbeddingMixOpConfig *config = (NnEmbeddingMixOpConfig *)opConfig->config;
-        if (config->mode == EMBEDDING_MIX_LOCAL_MAX || config->mode == EMBEDDING_MIX_GLOBAL_MAX) {
+    if (opCode == OP_TIED_EMBEDDING) {
+        const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
+        if (config->mode == TIED_EMBEDDING_LOCAL_MAX || config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
             if (quantType == F32_F32_F32) return "embedding-mix-max-forward-f32-f32.spv";
         }
-        if (config->mode == EMBEDDING_MIX_LOCAL_SUM) {
+        if (config->mode == TIED_EMBEDDING_LOCAL_SUM) {
             if (quantType == F32_F32_F32) return "embedding-mix-sum-forward-f32-f32-f32.spv";
             if (quantType == F32_Q40_F32) return "embedding-mix-sum-forward-f32-q40-f32.spv";
         }
-        if (config->mode == EMBEDDING_MIX_FINALIZE) {
+        if (config->mode == TIED_EMBEDDING_FINALIZE) {
             if (quantType == F32_F32_F32) return "embedding-mix-finalize-forward-f32-f32.spv";
         }
     }
@@ -708,11 +708,11 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->keyCacheBufferIndex)});
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->valueCacheBufferIndex)});
         } break;
-        case OP_EMBEDDING_MIX: {
-            const NnEmbeddingMixOpConfig *config = (NnEmbeddingMixOpConfig *)opConfig->config;
-            if (config->mode == EMBEDDING_MIX_LOCAL_MAX || config->mode == EMBEDDING_MIX_GLOBAL_MAX) {
+        case OP_TIED_EMBEDDING: {
+            const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
+            if (config->mode == TIED_EMBEDDING_LOCAL_MAX || config->mode == TIED_EMBEDDING_GLOBAL_MAX) {
                 a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
-            } else if (config->mode == EMBEDDING_MIX_LOCAL_SUM) {
+            } else if (config->mode == TIED_EMBEDDING_LOCAL_SUM) {
                 a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->globalMaxBufferIndex)});
                 a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
             }
@@ -866,9 +866,9 @@ static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const
         return ((NnMultiHeadAttOpConfig *)opConfig->config)->nHeads0;
     if (opConfig->code == OP_DIFFUSION_ATTENTION)
         return ((NnDiffusionAttentionOpConfig *)opConfig->config)->nQueryHeads;
-    if (opConfig->code == OP_EMBEDDING_MIX) {
-        const NnEmbeddingMixOpConfig *config = (NnEmbeddingMixOpConfig *)opConfig->config;
-        if (config->mode == EMBEDDING_MIX_LOCAL_SUM || config->mode == EMBEDDING_MIX_FINALIZE) {
+    if (opConfig->code == OP_TIED_EMBEDDING) {
+        const NnTiedEmbeddingOpConfig *config = (NnTiedEmbeddingOpConfig *)opConfig->config;
+        if (config->mode == TIED_EMBEDDING_LOCAL_SUM || config->mode == TIED_EMBEDDING_FINALIZE) {
             constexpr NnUint chunkSize = 32u; // Shader local size
             return (outputSize.x + chunkSize - 1u) / chunkSize;
         }
