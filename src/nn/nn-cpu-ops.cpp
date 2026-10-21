@@ -930,10 +930,10 @@ static void weightedAccumulate_F32(
         output[i] = output[i] * outputScale + value[i] * valueScale;
 }
 
-static void tiedEmbeddingPartial_F32_F32_F32(
+static void tiedEmbeddingPartial_F32(
     NnByte **logitRows,
     NnByte **rawLogitRows,
-    const float *transposedEmbedding,
+    float *probabilities,
     float *partials,
     const NnUint vocabSize,
     const NnUint hiddenSize,
@@ -944,118 +944,29 @@ static void tiedEmbeddingPartial_F32_F32_F32(
     const NnUint batchStart,
     const NnUint batchEnd)
 {
-    const NnUint count = batchEnd - batchStart;
-    if (count == 0u)
-        return;
-    std::vector<float> probabilities(count * vocabSize);
-    std::vector<float> numerator(count * hiddenSize);
-    std::vector<float> maxima(count, -INFINITY);
-    std::vector<float> denominators(count, 0.0f);
-    for (NnUint b = 0u; b < count; ++b) {
-        float *partial = partials + (batchStart + b) * tileCount * physicalSize;
+    for (NnUint batch = batchStart; batch < batchEnd; ++batch) {
+        float *partial = partials + batch * tileCount * physicalSize;
         std::fill(partial, partial + tileCount * physicalSize, 0.0f);
         for (NnUint tile = 1u; tile < tileCount; ++tile) {
             partial[tile * physicalSize + hiddenSize + 1u] = -INFINITY;
         }
 
-        const float *rawLogits = reinterpret_cast<const float *>(rawLogitRows[batchStart + b]);
-        float *logits = reinterpret_cast<float *>(logitRows[batchStart + b]);
+        const float *rawLogits = reinterpret_cast<const float *>(rawLogitRows[batch]);
+        float *logits = reinterpret_cast<float *>(logitRows[batch]);
+        float maximum = -INFINITY;
         for (NnUint token = 0u; token < vocabSize; ++token) {
             const float logit = logitSoftcap * tanhf(rawLogits[token] / logitSoftcap);
             logits[token] = logit;
-            maxima[b] = std::max(maxima[b], logit * inverseTemperature);
+            maximum = std::max(maximum, logit * inverseTemperature);
         }
+        float denominator = 0.0f;
         for (NnUint token = 0u; token < vocabSize; ++token) {
-            const float probability = expf(logits[token] * inverseTemperature - maxima[b]);
-            probabilities[b * vocabSize + token] = probability;
-            denominators[b] += probability;
+            const float probability = expf(logits[token] * inverseTemperature - maximum);
+            probabilities[batch * vocabSize + token] = probability;
+            denominator += probability;
         }
-    }
-    if (!llamafile_sgemm(hiddenSize, count, vocabSize,
-            transposedEmbedding, vocabSize, probabilities.data(), vocabSize,
-            numerator.data(), hiddenSize, 0, 1, 0, F_32, F_32, F_32)) {
-        for (NnUint b = 0u; b < count; ++b)
-            matmul_F32_F32_F32(numerator.data() + b * hiddenSize,
-                probabilities.data() + b * vocabSize, transposedEmbedding,
-                vocabSize, hiddenSize, 1u, 0u);
-    }
-    for (NnUint b = 0u; b < count; ++b) {
-        float *partial = partials + (batchStart + b) * tileCount * physicalSize;
-        std::copy(numerator.data() + b * hiddenSize,
-            numerator.data() + (b + 1u) * hiddenSize, partial);
-        partial[hiddenSize] = denominators[b];
-        partial[hiddenSize + 1u] = maxima[b];
-    }
-}
-
-
-// Consume precomputed logits, cast their unnormalized probabilities to Q80,
-// and multiply them by the converter-generated [hidden, vocabulary] Q40 weight.
-// Thread ownership is by batch, with no barriers.
-static void tiedEmbeddingPartial_F32_Q40_F32(
-    NnByte **logitRows,
-    NnByte **rawLogitRows,
-    const NnBlockQ40 *transposedEmbedding,
-    float *partials,
-    const NnUint vocabSize,
-    const NnUint hiddenSize,
-    const NnUint physicalSize,
-    const NnUint tileCount,
-    const float inverseTemperature,
-    const float logitSoftcap,
-    const NnUint batchStart,
-    const NnUint batchEnd)
-{
-    const NnUint count = batchEnd - batchStart;
-    if (count == 0u)
-        return;
-    assert(vocabSize % Q80_BLOCK_SIZE == 0u);
-    const NnUint vocabBlocks = vocabSize / Q80_BLOCK_SIZE;
-    std::vector<NnBlockQ80> probabilities(count * vocabBlocks);
-    std::vector<float> numerator(count * hiddenSize);
-    std::vector<float> maxima(count, -INFINITY);
-    std::vector<float> denominators(count, 0.0f);
-    for (NnUint b = 0u; b < count; ++b) {
-        float *partial = partials + (batchStart + b) * tileCount * physicalSize;
-        std::fill(partial, partial + tileCount * physicalSize, 0.0f);
-        for (NnUint tile = 1u; tile < tileCount; ++tile) {
-            partial[tile * physicalSize + hiddenSize + 1u] = -INFINITY;
-        }
-
-        const float *rawLogits = reinterpret_cast<const float *>(rawLogitRows[batchStart + b]);
-        float *logits = reinterpret_cast<float *>(logitRows[batchStart + b]);
-        for (NnUint token = 0u; token < vocabSize; ++token) {
-            const float logit = logitSoftcap * tanhf(rawLogits[token] / logitSoftcap);
-            logits[token] = logit;
-            maxima[b] = std::max(maxima[b], logit * inverseTemperature);
-        }
-        float probabilityBlock[Q80_BLOCK_SIZE];
-        for (NnUint block = 0u; block < vocabBlocks; ++block) {
-            for (NnUint i = 0u; i < Q80_BLOCK_SIZE; ++i) {
-                const NnUint token = block * Q80_BLOCK_SIZE + i;
-                probabilityBlock[i] = expf(
-                    logits[token] * inverseTemperature - maxima[b]);
-                denominators[b] += probabilityBlock[i];
-            }
-            quantizeF32toQ80(probabilityBlock,
-                probabilities.data() + b * vocabBlocks + block,
-                Q80_BLOCK_SIZE, 1u, 0u);
-        }
-    }
-    if (!llamafile_sgemm(hiddenSize, count, vocabBlocks,
-            transposedEmbedding, vocabBlocks, probabilities.data(), vocabBlocks,
-            numerator.data(), hiddenSize, 0, 1, 0, F_Q40, F_Q80, F_32)) {
-        for (NnUint b = 0u; b < count; ++b)
-            matmul_Q80_Q40_F32(numerator.data() + b * hiddenSize,
-                probabilities.data() + b * vocabBlocks, transposedEmbedding,
-                vocabSize, hiddenSize, 1u, 0u);
-    }
-    for (NnUint b = 0u; b < count; ++b) {
-        float *partial = partials + (batchStart + b) * tileCount * physicalSize;
-        std::copy(numerator.data() + b * hiddenSize,
-            numerator.data() + (b + 1u) * hiddenSize, partial);
-        partial[hiddenSize] = denominators[b];
-        partial[hiddenSize + 1u] = maxima[b];
+        partial[hiddenSize] = denominator;
+        partial[hiddenSize + 1u] = maximum;
     }
 }
 
@@ -1063,6 +974,7 @@ static void tiedEmbeddingReduce_F32(
     NnByte **maximumRows,
     NnByte **partialRows,
     float *embeddingMix,
+    const float *numerators,
     const NnUint hiddenSize,
     const NnUint physicalSize,
     const NnUint tileCount,
@@ -1085,6 +997,9 @@ static void tiedEmbeddingReduce_F32(
             denominator += partial[hiddenSize] * scale;
             weightedAccumulate_F32(output, partial, hiddenSize, 1.0f, scale);
         }
+        const float numeratorScale = expf(partials[hiddenSize + 1u] - maximum);
+        weightedAccumulate_F32(output, numerators + batch * hiddenSize,
+            hiddenSize, 1.0f, numeratorScale);
         output[hiddenSize] = denominator;
         reinterpret_cast<float *>(maximumRows[batch])[0] = maximum;
     }
@@ -1887,12 +1802,11 @@ static void diffusionAttentionForward_F32_F32(
 static void initTiedEmbeddingPartialForward(NnCpuOpContext *context) {
     const NnTiedEmbeddingPartialOpConfig *config =
         (NnTiedEmbeddingPartialOpConfig *)context->opConfig;
-    if (context->weightSize.floatType != F_32 && context->weightSize.floatType != F_Q40)
-        throw std::invalid_argument("TIED_EMBEDDING_PARTIAL supports F32 and Q40 embeddings");
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_32);
-    const NnUint vocabSize = context->weightSize.x;
-    const NnUint hiddenSize = context->weightSize.y;
+    assert(context->weightSize.nBytes == 0u);
+    const NnUint vocabSize = context->inputSize.x;
+    const NnUint hiddenSize = config->hiddenSize;
     ASSERT_EQ(context->inputSize.x, vocabSize);
     ASSERT_EQ(context->outputSize.x, vocabSize);
     ASSERT_EQ(context->inputSize.y, context->nBatches);
@@ -1906,6 +1820,11 @@ static void initTiedEmbeddingPartialForward(NnCpuOpContext *context) {
     ASSERT_EQ(partial->size.floatType, F_32);
     ASSERT_EQ(partial->size.x, config->tileCount * config->physicalSize);
     ASSERT_EQ(partial->size.y, context->nBatches);
+    const NnBufferConfig *probabilities =
+        &context->bufferConfigs[config->probabilityBufferIndex];
+    ASSERT_EQ(probabilities->size.floatType, F_32);
+    ASSERT_EQ(probabilities->size.x, vocabSize);
+    ASSERT_EQ(probabilities->size.y, context->nBatches);
     const NnPipeConfig *temperature = &context->pipeConfigs[config->temperaturePipeIndex];
     ASSERT_EQ(temperature->size.floatType, F_32);
     assert(temperature->size.length == 1u);
@@ -1926,6 +1845,10 @@ static void initTiedEmbeddingReduceForward(NnCpuOpContext *context) {
     ASSERT_EQ(mix->size.floatType, F_32);
     ASSERT_EQ(mix->size.x, config->physicalSize);
     ASSERT_EQ(mix->size.y, context->nBatches);
+    const NnBufferConfig *numerator = &context->bufferConfigs[config->numeratorBufferIndex];
+    ASSERT_EQ(numerator->size.floatType, F_32);
+    ASSERT_EQ(numerator->size.x, config->hiddenSize);
+    ASSERT_EQ(numerator->size.y, context->nBatches);
 }
 
 static void initReduceMaxForward(NnCpuOpContext *context) {
@@ -1989,40 +1912,13 @@ static void tiedEmbeddingPartialForward_F32_F32_F32(
     if (!(temperature > 0.0f) || !std::isfinite(temperature))
         throw std::runtime_error("TIED_EMBEDDING temperature must be finite and positive");
     SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
-    tiedEmbeddingPartial_F32_F32_F32(
+    tiedEmbeddingPartial_F32(
         context->output,
         context->input,
-        reinterpret_cast<const float *>(context->weight),
+        reinterpret_cast<float *>(context->buffers[config->probabilityBufferIndex]),
         reinterpret_cast<float *>(context->buffers[config->partialBufferIndex]),
-        context->weightSize.x,
-        context->weightSize.y,
-        config->physicalSize,
-        config->tileCount,
-        1.0f / temperature,
-        config->logitSoftcap,
-        batchStart,
-        batchEnd);
-}
-
-static void tiedEmbeddingPartialForward_F32_Q40_F32(
-    NnUint nThreads,
-    NnUint threadIndex,
-    NnUint batchSize,
-    NnCpuOpContext *context)
-{
-    const NnTiedEmbeddingPartialOpConfig *config =
-        (NnTiedEmbeddingPartialOpConfig *)context->opConfig;
-    const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
-    if (!(temperature > 0.0f) || !std::isfinite(temperature))
-        throw std::runtime_error("TIED_EMBEDDING temperature must be finite and positive");
-    SPLIT_THREADS(batchStart, batchEnd, batchSize, nThreads, threadIndex);
-    tiedEmbeddingPartial_F32_Q40_F32(
-        context->output,
-        context->input,
-        reinterpret_cast<const NnBlockQ40 *>(context->weight),
-        reinterpret_cast<float *>(context->buffers[config->partialBufferIndex]),
-        context->weightSize.x,
-        context->weightSize.y,
+        context->inputSize.x,
+        config->hiddenSize,
         config->physicalSize,
         config->tileCount,
         1.0f / temperature,
@@ -2044,6 +1940,7 @@ static void tiedEmbeddingReduceForward_F32_F32_F32(
         context->output,
         context->input,
         reinterpret_cast<float *>(context->buffers[config->embeddingMixBufferIndex]),
+        reinterpret_cast<const float *>(context->buffers[config->numeratorBufferIndex]),
         config->hiddenSize,
         config->physicalSize,
         config->tileCount,
@@ -2665,7 +2562,6 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     }
     if (code == OP_TIED_EMBEDDING_PARTIAL) {
         if (quantType == F32_F32_F32) return tiedEmbeddingPartialForward_F32_F32_F32;
-        if (quantType == F32_Q40_F32) return tiedEmbeddingPartialForward_F32_Q40_F32;
     }
     if (code == OP_TIED_EMBEDDING_REDUCE) {
         if (quantType == F32_F32_F32) return tiedEmbeddingReduceForward_F32_F32_F32;

@@ -65,6 +65,9 @@ struct NodeBuilder {
     NnUint ropeFull;
     NnUint globalVocabularyMax;
     NnUint partialEmbeddingMix;
+    NnUint embeddingProbabilities;
+    NnUint quantEmbeddingProbabilities;
+    NnUint embeddingNumerator;
     NnUint localEmbeddingMix;
     NnUint globalEmbeddingMix;
 
@@ -109,13 +112,6 @@ struct NodeBuilder {
     }
 
     NnUint localVocab() const { return h.vocabSize / nNodes; }
-    NnUint tiedEmbeddingTileSize() const {
-#if defined(DLLAMA_VULKAN)
-        return std::min(localVocab(), NN_TIED_EMBEDDING_VULKAN_TILE_SIZE);
-#else
-        return localVocab();
-#endif
-    }
     NnPaddedShard denseShard() const { return paddedShard(h.denseIntermediateSize, nNodes, nodeIndex, 32u); }
     NnPaddedShard moeShard() const { return paddedShard(h.moeIntermediateSize, nNodes, nodeIndex, 32u); }
 
@@ -183,11 +179,17 @@ struct NodeBuilder {
         ropeSliding = node.addBuffer("rope_sliding", size2D(F_32, context, h.slidingHeadDim));
         ropeFull = node.addBuffer("rope_full", size2D(F_32, context, h.fullHeadDim));
         const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
-        const NnUint tileSize = tiedEmbeddingTileSize();
-        const NnUint tileCount = (localVocab() + tileSize - 1u) / tileSize;
         globalVocabularyMax = node.addBuffer("global_vocabulary_max", size2D(F_32, batches, 1u));
         partialEmbeddingMix = node.addBuffer("partial_embedding_mix",
-            size2D(F_32, batches, tileCount * mixWidth));
+            size2D(F_32, batches, mixWidth));
+        embeddingProbabilities = node.addBuffer("embedding_probabilities",
+            size2D(F_32, batches, localVocab()));
+        quantEmbeddingProbabilities = weightType == F_Q40
+            ? node.addBuffer("quant_embedding_probabilities",
+                size2D(F_Q80, batches, localVocab()))
+            : embeddingProbabilities;
+        embeddingNumerator = node.addBuffer("embedding_numerator",
+            size2D(F_32, batches, h.hiddenSize));
         localEmbeddingMix = node.addBuffer("local_embedding_mix", size2D(F_32, batches, mixWidth));
         globalEmbeddingMix = node.addBuffer("global_embedding_mix", size2D(F_32, batches, mixWidth));
 
@@ -214,7 +216,7 @@ struct NodeBuilder {
             size2D(weightType, localVocab(), h.hiddenSize), DIFFUSION_GEMMA_WEIGHT_VOCAB_ROWS,
             nodeIndex * localVocab(), localVocab(), localVocab());
         embeddingMixWeight = addWeight("token_embedding.mix_weight", "token_embedding.mix_weight",
-            size2D(weightType, h.hiddenSize, localVocab()), DIFFUSION_GEMMA_WEIGHT_COLUMNS,
+            size2D(weightType, localVocab(), h.hiddenSize), DIFFUSION_GEMMA_WEIGHT_COLUMNS,
             nodeIndex * localVocab(), localVocab(), localVocab());
         scPreNormWeight = addWeight("self_conditioning.pre_norm.weight", "self_conditioning.pre_norm.weight",
             size1D(F_32, h.hiddenSize), DIFFUSION_GEMMA_WEIGHT_REPLICATED);
@@ -612,19 +614,28 @@ struct NodeBuilder {
         NnSegmentConfigBuilder maxima;
         if (decoder) {
             const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
-            const NnUint tileSize = tiedEmbeddingTileSize();
-            const NnUint tileCount = (localVocab() + tileSize - 1u) / tileSize;
-            maxima.addOp(OP_TIED_EMBEDDING_PARTIAL, "token_embedding.mix_weight", 0u,
+            maxima.addOp(OP_TIED_EMBEDDING_PARTIAL, "embedding_mix.probabilities", 0u,
                 pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
-                size2D(weightType, h.hiddenSize, localVocab()),
-                embeddingMixWeight,
+                size0(),
                 NnTiedEmbeddingPartialOpConfig{pipes.temperature, partialEmbeddingMix,
-                    mixWidth, tileSize, tileCount, h.hiddenSize, h.logitSoftcap});
+                    embeddingProbabilities, mixWidth, localVocab(), 1u,
+                    h.hiddenSize, h.logitSoftcap});
+            if (weightType == F_Q40) {
+                maxima.addOp(OP_CAST, "embedding_mix.quantize_probabilities", 0u,
+                    pointerBatchConfig(SRC_BUFFER, embeddingProbabilities),
+                    pointerBatchConfig(SRC_BUFFER, quantEmbeddingProbabilities),
+                    size0(), NnCastOpCodeConfig{});
+            }
+            maxima.addOp(OP_MATMUL, "token_embedding.mix_weight", 0u,
+                pointerBatchConfig(SRC_BUFFER, quantEmbeddingProbabilities),
+                pointerBatchConfig(SRC_BUFFER, embeddingNumerator),
+                size2D(weightType, localVocab(), h.hiddenSize),
+                embeddingMixWeight, NnMatmulOpConfig{0u, 0u, expertIndexes});
             maxima.addOp(OP_TIED_EMBEDDING_REDUCE, "embedding_mix.reduce_tiles", 0u,
                 pointerBatchConfig(SRC_BUFFER, partialEmbeddingMix),
                 pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync), size0(),
-                NnTiedEmbeddingReduceOpConfig{localEmbeddingMix, mixWidth,
-                    tileCount, h.hiddenSize});
+                NnTiedEmbeddingReduceOpConfig{localEmbeddingMix, embeddingNumerator,
+                    mixWidth, 1u, h.hiddenSize});
             maxima.addSync(pipes.vocabularyMaxSync, SYNC_NODE_SLICES);
             node.addSegment(maxima.build());
             return;

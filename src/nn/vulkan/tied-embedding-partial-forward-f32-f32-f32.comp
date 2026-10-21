@@ -1,6 +1,6 @@
 #version 450
 
-#define N_THREADS 32
+#define N_THREADS 128
 
 layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
 
@@ -17,59 +17,72 @@ struct BatchInfo {
 layout(binding = 0) readonly buffer inputBuffer { float inputLogits[]; };
 layout(binding = 1) buffer outputBuffer { float logits[]; };
 layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
-layout(binding = 3) readonly buffer weightBuffer { float embedding[]; };
-layout(binding = 4) readonly uniform configBuffer {
+layout(binding = 3) readonly uniform configBuffer {
     uint temperaturePipeIndex;
     uint partialBufferIndex;
+    uint probabilityBufferIndex;
     uint physicalSize;
     uint tileSize;
     uint tileCount;
     uint hiddenSize;
     float logitSoftcap;
 };
-layout(binding = 5) writeonly buffer partialBuffer { float partials[]; };
-layout(binding = 6) readonly buffer temperatureBuffer { float temperature[]; };
+layout(binding = 4) writeonly buffer partialBuffer { float partials[]; };
+layout(binding = 5) readonly buffer temperatureBuffer { float temperature[]; };
+layout(binding = 6) writeonly buffer probabilityBuffer { float probabilities[]; };
 
-shared float maximum;
-shared float denominator;
+shared float values[N_THREADS];
 
 void main() {
-    const uint tile = gl_WorkGroupID.x;
     const uint batch = gl_WorkGroupID.y;
     const uint lane = gl_LocalInvocationID.x;
     const BatchInfo info = infos[batch];
-    const uint tokenStart = tile * tileSize;
-    const uint tokenEnd = min(tokenStart + tileSize, info.outputSizeX);
-    const uint partialOffset = (batch * tileCount + tile) * physicalSize;
+    const uint partialOffset = batch * tileCount * physicalSize;
     const float inverseTemperature = 1.0f / temperature[0];
 
+    for (uint i = lane; i < tileCount * physicalSize; i += N_THREADS)
+        partials[partialOffset + i] = 0.0f;
     if (lane == 0u) {
-        maximum = -3.402823466e+38f;
-        for (uint token = tokenStart; token < tokenEnd; ++token) {
-            const float rawLogit = inputLogits[info.inputOffset + token];
-            const float logit = logitSoftcap * tanh(rawLogit / logitSoftcap);
-            logits[info.outputOffset + token] = logit;
-            maximum = max(maximum, logit * inverseTemperature);
-        }
-        denominator = 0.0f;
-        for (uint token = tokenStart; token < tokenEnd; ++token)
-            denominator += exp(logits[info.outputOffset + token] * inverseTemperature - maximum);
+        for (uint tile = 1u; tile < tileCount; ++tile)
+            partials[partialOffset + tile * physicalSize + HIDDEN_SIZE + 1u] =
+                -3.402823466e+38f;
     }
     barrier();
 
-    for (uint h = lane; h < HIDDEN_SIZE; h += N_THREADS) {
-        float numerator = 0.0f;
-        for (uint token = tokenStart; token < tokenEnd; ++token) {
-            const float probability = exp(
-                logits[info.outputOffset + token] * inverseTemperature - maximum);
-            numerator += embedding[h * info.outputSizeX + token] * probability;
-        }
-        partials[partialOffset + h] = numerator;
+    float maximum = -3.402823466e+38f;
+    for (uint token = lane; token < info.outputSizeX; token += N_THREADS) {
+        const float rawLogit = inputLogits[info.inputOffset + token];
+        const float logit = logitSoftcap * tanh(rawLogit / logitSoftcap);
+        logits[info.outputOffset + token] = logit;
+        maximum = max(maximum, logit * inverseTemperature);
     }
+    values[lane] = maximum;
+    barrier();
+    for (uint stride = N_THREADS / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            values[lane] = max(values[lane], values[lane + stride]);
+        barrier();
+    }
+    maximum = values[0];
+    barrier();
+
+    float denominator = 0.0f;
+    for (uint token = lane; token < info.outputSizeX; token += N_THREADS) {
+        const float probability = exp(
+            logits[info.outputOffset + token] * inverseTemperature - maximum);
+        probabilities[batch * info.outputSizeX + token] = probability;
+        denominator += probability;
+    }
+    values[lane] = denominator;
+    barrier();
+    for (uint stride = N_THREADS / 2u; stride > 0u; stride >>= 1u) {
+        if (lane < stride)
+            values[lane] += values[lane + stride];
+        barrier();
+    }
+
     if (lane == 0u) {
-        partials[partialOffset + HIDDEN_SIZE] = denominator;
+        partials[partialOffset + HIDDEN_SIZE] = values[0];
         partials[partialOffset + HIDDEN_SIZE + 1u] = maximum;
     }
-    for (uint h = HIDDEN_SIZE + 2u + lane; h < physicalSize; h += N_THREADS)
-        partials[partialOffset + h] = 0.0f;
 }

@@ -355,6 +355,7 @@ typedef struct {
 typedef struct {
     NnUint temperaturePipeIndex;
     NnUint partialBufferIndex;
+    NnUint probabilityBufferIndex;
     NnUint physicalSize;
     NnUint tileSize;
     NnUint tileCount;
@@ -364,6 +365,7 @@ typedef struct {
 
 typedef struct {
     NnUint embeddingMixBufferIndex;
+    NnUint numeratorBufferIndex;
     NnUint physicalSize;
     NnUint tileCount;
     NnUint hiddenSize;
@@ -386,7 +388,6 @@ typedef struct {
     float embeddingScale;
 } NnEmbeddingMixFinalizeOpConfig;
 
-#define NN_TIED_EMBEDDING_VULKAN_TILE_SIZE 8192u
 
 #define NN_VOCAB_STATS_WIDTH 5u
 #define NN_VOCAB_MICROSHARDS 8u

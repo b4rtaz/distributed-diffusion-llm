@@ -127,13 +127,11 @@ private:
     std::vector<NnUint> batchInfoBufferIndex;
     std::vector<NnUint> weightBufferIndex;
     std::vector<NnUint> configBufferIndex;
-    std::vector<NnUint> tiedProbabilityBufferIndex;
 public:
     NnVulkanDeviceSegmentData(NnVulkanBufferFactory *bufferFactory, NnVulkanDeviceData *data, NnSegmentConfig *segmentConfig, NnUint nBatches);
     NnVulkanBuffer *resolveOpBatchInfoVulkanBuffer(NnUint opIndex);
     NnVulkanBuffer *resolveOpWeightVulkanBuffer(NnUint opIndex, const NnOpConfig *opConfig);
     NnVulkanBuffer *resolveOpConfigVulkanBuffer(NnUint opIndex);
-    NnVulkanBuffer *resolveTiedProbabilityBuffer(NnUint opIndex);
 };
 
 enum NnOpBufferAccessType {
@@ -165,8 +163,6 @@ private:
     vk::Fence fence;
     std::vector<vk::PipelineLayout> pipelineLayouts;
     std::vector<vk::Pipeline> pipelines;
-    std::vector<std::vector<vk::ShaderModule>> tiedShaderModules;
-    std::vector<std::vector<vk::Pipeline>> tiedPipelines;
     vk::PipelineCache pipelineCache;
     vk::CommandBuffer commandBuffer;
     std::vector<std::vector<NnVulkanBuffer *>> buffersToSync;

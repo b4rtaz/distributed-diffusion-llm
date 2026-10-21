@@ -19,11 +19,13 @@ layout(binding = 1) writeonly buffer maximumBuffer { float vocabularyMaximum[]; 
 layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
 layout(binding = 3) readonly uniform configBuffer {
     uint embeddingMixBufferIndex;
+    uint numeratorBufferIndex;
     uint physicalSize;
     uint tileCount;
     uint hiddenSize;
 };
 layout(binding = 4) writeonly buffer outputBuffer { float outputValues[]; };
+layout(binding = 5) readonly buffer numeratorBuffer { float numerators[]; };
 
 shared float tileScales[TILE_COUNT];
 shared float maximum;
@@ -50,7 +52,8 @@ void main() {
     barrier();
 
     for (uint h = lane; h < hiddenSize; h += N_THREADS) {
-        float value = 0.0f;
+        float value = exp(partials[info.inputOffset + hiddenSize + 1u] - maximum) *
+            numerators[batch * hiddenSize + h];
         for (uint tile = 0u; tile < tileCount; ++tile)
             value += tileScales[tile] * partials[info.inputOffset + tile * physicalSize + h];
         outputValues[mixOffset + h] = value;

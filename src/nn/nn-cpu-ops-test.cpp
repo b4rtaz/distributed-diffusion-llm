@@ -659,6 +659,8 @@ void testTiedEmbedding(float temperature = 0.7f) {
     float logits[batches][vocab];
     float partials[batches][tileCount * physicalSize];
     float mix[batches][physicalSize];
+    float probabilities[batches][vocab];
+    float numerators[batches][hiddenSize];
     float maxima[batches * nNodes];
     std::fill(maxima, maxima + batches * nNodes, -123.0f);
     NnByte *logitRows[batches];
@@ -680,17 +682,10 @@ void testTiedEmbedding(float temperature = 0.7f) {
 
     auto work = [&](NnUint thread) {
         SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
-        if (quantized) {
-            tiedEmbeddingPartial_F32_Q40_F32(
-                logitRows, rawLogitRows, quantMixEmbedding.data(), &partials[0][0],
-                vocab, hiddenSize, physicalSize, tileCount,
-                1.0f / temperature, softcap, batchStart, batchEnd);
-        } else {
-            tiedEmbeddingPartial_F32_F32_F32(
-                logitRows, rawLogitRows, transposed.data(), &partials[0][0],
-                vocab, hiddenSize, physicalSize, tileCount,
-                1.0f / temperature, softcap, batchStart, batchEnd);
-        }
+        tiedEmbeddingPartial_F32(
+            logitRows, rawLogitRows, &probabilities[0][0], &partials[0][0],
+            vocab, hiddenSize, physicalSize, tileCount,
+            1.0f / temperature, softcap, batchStart, batchEnd);
     };
     std::vector<std::thread> workers;
     for (NnUint thread = 1u; thread < threads; ++thread)
@@ -698,10 +693,24 @@ void testTiedEmbedding(float temperature = 0.7f) {
     work(0u);
     for (auto &worker : workers)
         worker.join();
+    if (quantized) {
+        NnBlockQ80 quantizedProbabilities[batches * vocab / Q80_BLOCK_SIZE];
+        quantizeF32toQ80(&probabilities[0][0], quantizedProbabilities,
+            batches * vocab, 1u, 0u);
+        for (NnUint batch = 0u; batch < batches; ++batch)
+            matmul_Q80_Q40_F32(numerators[batch],
+                quantizedProbabilities + batch * vocab / Q80_BLOCK_SIZE,
+                quantMixEmbedding.data(), vocab, hiddenSize, 1u, 0u);
+    } else {
+        for (NnUint batch = 0u; batch < batches; ++batch)
+            matmul_F32_F32_F32(numerators[batch], probabilities[batch],
+                transposed.data(), vocab, hiddenSize, 1u, 0u);
+    }
     for (NnUint thread = 0u; thread < threads; ++thread) {
         SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
         tiedEmbeddingReduce_F32(
-            maximumRows, partialRows, &mix[0][0], hiddenSize, physicalSize, tileCount,
+            maximumRows, partialRows, &mix[0][0], &numerators[0][0],
+            hiddenSize, physicalSize, tileCount,
             batchStart, batchEnd);
     }
 

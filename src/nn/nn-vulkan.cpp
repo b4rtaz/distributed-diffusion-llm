@@ -542,11 +542,6 @@ void NnVulkanDevice::writeBuffer(NnUint bufferIndex, const NnByte *source) {
     data.resolveBufferByIndex(bufferIndex)->write(source);
 }
 
-static bool isTiledQ40Embedding(const NnOpConfig *op) {
-    return op->code == OP_TIED_EMBEDDING_PARTIAL &&
-        op->weightSize.floatType == F_Q40;
-}
-
 static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuantType quantType) {
     const NnOpCode opCode = opConfig->code;
     if (opCode == OP_MERGE_ADD) {
@@ -579,7 +574,6 @@ static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuant
     }
     if (opCode == OP_TIED_EMBEDDING_PARTIAL) {
         if (quantType == F32_F32_F32) return "tied-embedding-partial-forward-f32-f32-f32.spv";
-        if (quantType == F32_Q40_F32) return "tied-embedding-softmax-forward-q40.spv";
     }
     if (opCode == OP_TIED_EMBEDDING_REDUCE) {
         if (quantType == F32_F32_F32) return "tied-embedding-reduce-forward-f32-f32.spv";
@@ -721,13 +715,14 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
                 (NnTiedEmbeddingPartialOpConfig *)opConfig->config;
             a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->partialBufferIndex)});
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
-            if (isTiledQ40Embedding(opConfig))
-                a.push_back({ACCESS_READ_WRITE, segmentData->resolveTiedProbabilityBuffer(opIndex)});
+            a.push_back({ACCESS_READ_WRITE,
+                data->resolveBufferByIndex(config->probabilityBufferIndex)});
         } break;
         case OP_TIED_EMBEDDING_REDUCE: {
             const NnTiedEmbeddingReduceOpConfig *config =
                 (NnTiedEmbeddingReduceOpConfig *)opConfig->config;
             a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->embeddingMixBufferIndex)});
+            a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->numeratorBufferIndex)});
         } break;
         case OP_REDUCE_MAX: {
             const NnReduceMaxOpConfig *config = (NnReduceMaxOpConfig *)opConfig->config;
@@ -980,18 +975,10 @@ NnVulkanDeviceSegmentData::NnVulkanDeviceSegmentData(NnVulkanBufferFactory *buff
     data(data),
     batchInfoBufferIndex(segmentConfig->nOps, UINT32_MAX),
     weightBufferIndex(segmentConfig->nOps, UINT32_MAX),
-    configBufferIndex(segmentConfig->nOps, UINT32_MAX),
-    tiedProbabilityBufferIndex(segmentConfig->nOps, UINT32_MAX)
+    configBufferIndex(segmentConfig->nOps, UINT32_MAX)
 {
     for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
         NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
-        if (isTiledQ40Embedding(opConfig)) {
-            const NnSize bytes = data->resolvePointerVulkanBuffer(&opConfig->output)->bufferSize;
-            data->internalBuffers.push_back(bufferFactory->create("tied_probabilities",
-                bytes, true, vk::BufferUsageFlagBits::eStorageBuffer, false));
-            tiedProbabilityBufferIndex[opIndex] = data->internalBuffers.size() - 1u;
-        }
-
         std::vector<NnVulkanBatchInfo> batchInfo = buildBatchInfo(opConfig, data, nBatches);
         VULKAN_TRACE("Resolved for %s %zu batch infos", opCodeToString(opConfig->code), batchInfo.size());
 
@@ -1030,11 +1017,6 @@ NnVulkanBuffer *NnVulkanDeviceSegmentData::resolveOpConfigVulkanBuffer(NnUint op
     return data->internalBuffers[configBufferIndex[opIndex]].get();
 }
 
-NnVulkanBuffer *NnVulkanDeviceSegmentData::resolveTiedProbabilityBuffer(NnUint opIndex) {
-    assert(tiedProbabilityBufferIndex[opIndex] != UINT32_MAX);
-    return data->internalBuffers[tiedProbabilityBufferIndex[opIndex]].get();
-}
-
 NnVulkanBuffer *NnVulkanDeviceSegmentData::resolveOpWeightVulkanBuffer(
     NnUint opIndex,
     const NnOpConfig *opConfig) {
@@ -1057,8 +1039,6 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanS
     descriptorSetLayouts(segmentConfig->nOps),
     pipelineLayouts(segmentConfig->nOps),
     pipelines(segmentConfig->nOps),
-    tiedShaderModules(segmentConfig->nOps),
-    tiedPipelines(segmentConfig->nOps),
     buffersToSync(segmentConfig->nOps)
 {
     this->segmentData.reset(new NnVulkanDeviceSegmentData(bufferFactory, data, segmentConfig, netExecution->nBatches));
@@ -1204,32 +1184,10 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanS
 
     for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
         vk::PipelineLayoutCreateInfo pipelineLayoutCreateInfo(vk::PipelineLayoutCreateFlags(), 1, &descriptorSetLayouts[opIndex]);
-        const bool tiled = isTiledQ40Embedding(&segmentConfig->ops[opIndex]);
-        const vk::PushConstantRange runtimeRange(vk::ShaderStageFlagBits::eCompute, 0u, sizeof(NnUint));
-        if (tiled) {
-            pipelineLayoutCreateInfo.pushConstantRangeCount = 1u;
-            pipelineLayoutCreateInfo.pPushConstantRanges = &runtimeRange;
-        }
         pipelineLayouts[opIndex] = context->device.createPipelineLayout(pipelineLayoutCreateInfo);
 
         vk::ComputePipelineCreateInfo pipelineInfo(vk::PipelineCreateFlags(), shaderCreateInfos[opIndex], pipelineLayouts[opIndex], vk::Pipeline(), 0);
         pipelines[opIndex] = context->device.createComputePipelines(pipelineCache, pipelineInfo).value.front();
-        if (tiled) {
-            const char *stages[] = {
-                "tied-embedding-mix-forward-q40.spv",
-            };
-            for (const char *file : stages) {
-                const auto code = readShader(file);
-                const auto module = context->device.createShaderModule(vk::ShaderModuleCreateInfo(
-                    vk::ShaderModuleCreateFlags(), code.size() * sizeof(uint32_t), code.data()));
-                tiedShaderModules[opIndex].push_back(module);
-                const vk::PipelineShaderStageCreateInfo stage(vk::PipelineShaderStageCreateFlags(),
-                    vk::ShaderStageFlagBits::eCompute, module, "main", &specInfos[opIndex]);
-                const vk::ComputePipelineCreateInfo info(vk::PipelineCreateFlags(), stage, pipelineLayouts[opIndex]);
-                tiedPipelines[opIndex].push_back(
-                    context->device.createComputePipelines(pipelineCache, info).value.front());
-            }
-        }
     }
 
     fence = context->device.createFence(vk::FenceCreateInfo());
@@ -1246,10 +1204,6 @@ NnVulkanDeviceSegment::~NnVulkanDeviceSegment() {
     context->device.destroyDescriptorPool(descriptorPool);
 
     for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
-        for (auto pipeline : tiedPipelines[opIndex])
-            context->device.destroyPipeline(pipeline);
-        for (auto module : tiedShaderModules[opIndex])
-            context->device.destroyShaderModule(module);
         context->device.destroyPipeline(pipelines[opIndex]);
         context->device.destroyPipelineLayout(pipelineLayouts[opIndex]);
     }
@@ -1350,23 +1304,6 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
             const NnSize3D inputSize = data->resolveBufferSize(&opConfig->input);
             const NnSize3D outputSize = data->resolveBufferSize(&opConfig->output);
 
-            if (isTiledQ40Embedding(opConfig)) {
-                const auto *config = reinterpret_cast<const NnTiedEmbeddingPartialOpConfig *>(opConfig->config);
-                commandBuffer.pushConstants(pipelineLayouts[opIndex], vk::ShaderStageFlagBits::eCompute,
-                    0u, sizeof(batchSize), &batchSize);
-                commandBuffer.dispatch(config->tileCount, batchSize, 1u);
-                // The softmax dispatch writes probabilities and partial
-                // statistics consumed by the weighted embedding mix.
-                const vk::MemoryBarrier barrier(vk::AccessFlagBits::eShaderWrite,
-                    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite);
-                commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-                    vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags(),
-                    {barrier}, {}, {});
-                commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, tiedPipelines[opIndex][0]);
-                commandBuffer.dispatch(config->tileCount * (config->hiddenSize / Q40_BLOCK_SIZE),
-                    (batchSize + 7u) / 8u, 1u);
-                continue;
-            }
             const NnUint groupCountX = resolveShaderNumberOfWorkGroupsX(opConfig, inputSize, outputSize);
             const NnUint groupCountY = batchSize;
             const NnUint groupCountZ = resolveShaderNumberOfWorkGroupsZ(opConfig, inputSize, outputSize);

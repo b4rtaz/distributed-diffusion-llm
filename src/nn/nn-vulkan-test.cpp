@@ -732,6 +732,14 @@ void testTiedEmbedding_F32() {
             netBuilder->addPreSync(temperaturePipeIndex);
             const NnUint partialBufferIndex = nodeBuilder->addBuffer("partials",
                 size2D(F_32, capacity, tileCount * physicalSize));
+            const NnUint probabilityBufferIndex = nodeBuilder->addBuffer("probabilities",
+                size2D(F_32, capacity, vocabSize));
+            const NnUint matmulProbabilityBufferIndex = quantized
+                ? nodeBuilder->addBuffer("quant_probabilities",
+                    size2D(F_Q80, capacity, vocabSize))
+                : probabilityBufferIndex;
+            const NnUint numeratorBufferIndex = nodeBuilder->addBuffer("numerator",
+                size2D(F_32, capacity, hiddenSize));
             const NnUint localMixBufferIndex = nodeBuilder->addBuffer("local_mix",
                 size2D(F_32, capacity, physicalSize));
             segmentBuilder->addOp(OP_MATMUL, "tied_embedding_weight", 0u,
@@ -740,18 +748,29 @@ void testTiedEmbedding_F32() {
                 size2D(quantized ? F_Q40 : F_32, hiddenSize, vocabSize),
                 NnMatmulOpConfig{0u, 0u, 0u});
             segmentBuilder->addOp(OP_TIED_EMBEDDING_PARTIAL,
-                "tied_embedding_mix_weight", 0u,
+                "tied_embedding_probabilities", 0u,
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
-                size2D(quantized ? F_Q40 : F_32, hiddenSize, vocabSize),
+                size0(),
                 NnTiedEmbeddingPartialOpConfig{temperaturePipeIndex,
-                    partialBufferIndex, physicalSize, tileSize, tileCount,
-                    hiddenSize, 2.5f});
+                    partialBufferIndex, probabilityBufferIndex, physicalSize,
+                    tileSize, tileCount, hiddenSize, 2.5f});
+            if (quantized) {
+                segmentBuilder->addOp(OP_CAST, "tied_embedding_quantize_probabilities", 0u,
+                    pointerBatchConfig(SRC_BUFFER, probabilityBufferIndex),
+                    pointerBatchConfig(SRC_BUFFER, matmulProbabilityBufferIndex),
+                    size0(), NnCastOpCodeConfig{});
+            }
+            segmentBuilder->addOp(OP_MATMUL, "tied_embedding_mix_weight", 0u,
+                pointerBatchConfig(SRC_BUFFER, matmulProbabilityBufferIndex),
+                pointerBatchConfig(SRC_BUFFER, numeratorBufferIndex),
+                size2D(quantized ? F_Q40 : F_32, vocabSize, hiddenSize),
+                NnMatmulOpConfig{0u, 0u, partialBufferIndex});
             segmentBuilder->addOp(OP_TIED_EMBEDDING_REDUCE, "tied_embedding_reduce", 0u,
                 pointerBatchConfig(SRC_BUFFER, partialBufferIndex),
                 pointerBatchConfig(SRC_PIPE, maximumPipeIndex), size0(),
-                NnTiedEmbeddingReduceOpConfig{localMixBufferIndex, physicalSize,
-                    tileCount, hiddenSize});
+                NnTiedEmbeddingReduceOpConfig{localMixBufferIndex, numeratorBufferIndex,
+                    physicalSize, tileCount, hiddenSize});
             segmentBuilder->addOp(OP_EMBEDDING_MIX_FINALIZE, "tied_embedding_finalize", 0u,
                 pointerBatchConfig(SRC_BUFFER, localMixBufferIndex),
                 pointerBatchConfig(SRC_PIPE, outputPipeIndex), size0(),
