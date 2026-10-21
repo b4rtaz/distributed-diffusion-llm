@@ -662,11 +662,11 @@ struct NodeBuilder {
                 pointerBatchConfig(SRC_BUFFER, localEmbeddingMix), pointerBatchedSliceConfig(SRC_PIPE, pipes.embeddingMixSync),
                 size0(), NnCastOpCodeConfig{});
         }
-        sum.addOp(OP_VOCAB_STATS, "sampler.local_stats", 0u,
+        sum.addOp(OP_VOCAB_LOCAL_STATS, "sampler.local_stats", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchedSliceConfig(SRC_PIPE, pipes.samplerStatsSync),
-            size0(), NnVocabStatsOpConfig{VOCAB_STATS_LOCAL, globalVocabularyMax, pipes.temperature,
-                pipes.samplingCoins, pipes.targetTokens, pipes.localLogits, nodeIndex * localVocab(), nodeIndex,
-                nodeIndex * (NN_VOCAB_MICROSHARDS / nNodes), NN_VOCAB_MICROSHARDS / nNodes, decoder ? 0u : 1u});
+            size0(), NnVocabLocalStatsOpConfig{globalVocabularyMax, pipes.temperature,
+                pipes.targetTokens, nodeIndex * localVocab(), NN_VOCAB_MICROSHARDS / nNodes,
+                decoder ? 0u : 1u});
         if (decoder)
             sum.addSync(pipes.embeddingMixSync, SYNC_NODE_SLICES);
         sum.addSync(pipes.samplerStatsSync, SYNC_NODE_SLICES);
@@ -682,11 +682,11 @@ struct NodeBuilder {
         finalize.addOp(OP_EMBEDDING_MIX_FINALIZE, "embedding_mix.finalize", 0u,
             pointerBatchConfig(SRC_BUFFER, globalEmbeddingMix), pointerBatchConfig(SRC_PIPE, pipes.selfConditioning),
             size0(), NnEmbeddingMixFinalizeOpConfig{mixWidth, h.embeddingScale});
-        finalize.addOp(OP_VOCAB_STATS, "sampler.sample", 0u,
+        finalize.addOp(OP_VOCAB_SAMPLE, "sampler.sample", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.samplerStatsSync), pointerBatchedSliceConfig(SRC_PIPE, pipes.sampledTokensSync),
-            size0(), NnVocabStatsOpConfig{VOCAB_STATS_SAMPLE, globalVocabularyMax, pipes.temperature,
-                pipes.samplingCoins, pipes.targetTokens, pipes.localLogits, nodeIndex * localVocab(), nodeIndex,
-                nodeIndex * (NN_VOCAB_MICROSHARDS / nNodes), NN_VOCAB_MICROSHARDS / nNodes, 0u});
+            size0(), NnVocabSampleOpConfig{globalVocabularyMax, pipes.temperature,
+                pipes.samplingCoins, pipes.localLogits, nodeIndex * localVocab(),
+                nodeIndex * (NN_VOCAB_MICROSHARDS / nNodes), NN_VOCAB_MICROSHARDS / nNodes});
         finalize.addSync(pipes.sampledTokensSync, SYNC_NODE_SLICES_EXCEPT_ROOT);
         node.addSegment(finalize.build());
     }

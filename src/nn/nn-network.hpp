@@ -5,7 +5,7 @@
 
 #define ROOT_SOCKET_INDEX 0
 #define NN_PROTOCOL_MAGIC 0x44444c4du
-#define NN_PROTOCOL_VERSION 4u
+#define NN_PROTOCOL_VERSION 5u
 
 void initSockets();
 void cleanupSockets();

@@ -2161,35 +2161,40 @@ static void embeddingMixFinalizeForward_F32_F32(
     }
 }
 
-static void initVocabStatsForward(NnCpuOpContext *context) {
-    const NnVocabStatsOpConfig *config = (NnVocabStatsOpConfig *)context->opConfig;
+static void initVocabLocalStatsForward(NnCpuOpContext *context) {
+    const NnVocabLocalStatsOpConfig *config =
+        (NnVocabLocalStatsOpConfig *)context->opConfig;
     assert(context->weightSize.nBytes == 0u);
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_32);
     ASSERT_EQ(context->inputSize.y, context->nBatches);
     ASSERT_EQ(context->outputSize.y, context->nBatches);
-    if (config->mode == VOCAB_STATS_LOCAL) {
-        ASSERT_EQ(context->outputSize.x, config->microshardCount * NN_VOCAB_STATS_WIDTH);
-        if (config->microshardCount == 0u || context->inputSize.x % config->microshardCount != 0u)
-            throw std::invalid_argument("VOCAB_STATS local vocabulary must divide into canonical microshards");
-        ASSERT_EQ(context->bufferConfigs[config->globalMaxBufferIndex].size.x, 1u);
-        ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.x, 1u);
-        ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.y, 1u);
-        if (config->useTargetTokens != 0u)
-            ASSERT_EQ(context->pipeConfigs[config->targetTokensPipeIndex].size.x, 1u);
-    } else if (config->mode == VOCAB_STATS_SAMPLE) {
-        if (context->inputSize.x == 0u || context->inputSize.x % NN_VOCAB_STATS_WIDTH != 0u)
-            throw std::invalid_argument("VOCAB_STATS sample input must contain complete node records");
-        ASSERT_EQ(context->outputSize.x, 1u);
-        ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.x, 1u);
-        ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.y, 1u);
-        ASSERT_EQ(context->pipeConfigs[config->samplingCoinsPipeIndex].size.x, 1u);
-        if (config->microshardCount == 0u ||
-            config->microshardStart + config->microshardCount > context->inputSize.x / NN_VOCAB_STATS_WIDTH)
-            throw std::invalid_argument("VOCAB_STATS microshard range is out of bounds");
-    } else {
-        throw std::invalid_argument("VOCAB_STATS has an invalid mode");
-    }
+    ASSERT_EQ(context->outputSize.x, config->microshardCount * NN_VOCAB_STATS_WIDTH);
+    if (config->microshardCount == 0u || context->inputSize.x % config->microshardCount != 0u)
+        throw std::invalid_argument("VOCAB_LOCAL_STATS vocabulary must divide into canonical microshards");
+    ASSERT_EQ(context->bufferConfigs[config->globalMaxBufferIndex].size.x, 1u);
+    ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.x, 1u);
+    ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.y, 1u);
+    if (config->useTargetTokens != 0u)
+        ASSERT_EQ(context->pipeConfigs[config->targetTokensPipeIndex].size.x, 1u);
+}
+
+static void initVocabSampleForward(NnCpuOpContext *context) {
+    const NnVocabSampleOpConfig *config = (NnVocabSampleOpConfig *)context->opConfig;
+    assert(context->weightSize.nBytes == 0u);
+    ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    ASSERT_EQ(context->inputSize.y, context->nBatches);
+    ASSERT_EQ(context->outputSize.y, context->nBatches);
+    if (context->inputSize.x == 0u || context->inputSize.x % NN_VOCAB_STATS_WIDTH != 0u)
+        throw std::invalid_argument("VOCAB_SAMPLE input must contain complete microshard records");
+    ASSERT_EQ(context->outputSize.x, 1u);
+    ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.x, 1u);
+    ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.y, 1u);
+    ASSERT_EQ(context->pipeConfigs[config->samplingCoinsPipeIndex].size.x, 1u);
+    if (config->microshardCount == 0u ||
+        config->microshardStart + config->microshardCount > context->inputSize.x / NN_VOCAB_STATS_WIDTH)
+        throw std::invalid_argument("VOCAB_SAMPLE microshard range is out of bounds");
 }
 
 static double shiftedVocabLogit(float logit, float inverseTemperature, float scaledMaximum) {
@@ -2200,108 +2205,120 @@ static double shiftedVocabLogit(float logit, float inverseTemperature, float sca
     return static_cast<double>(scaledLogit) - scaledMaximum;
 }
 
-static void vocabStatsForward(
+static void vocabLocalStatsForward(
     NnUint nThreads,
     NnUint threadIndex,
     NnUint batchSize,
     NnCpuOpContext *context) {
-    if (threadIndex != 0u)
-        return;
-    const NnVocabStatsOpConfig *config = (NnVocabStatsOpConfig *)context->opConfig;
+    const NnVocabLocalStatsOpConfig *config =
+        (NnVocabLocalStatsOpConfig *)context->opConfig;
     const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
     if (!(temperature > 0.0f) || !std::isfinite(temperature))
-        throw std::runtime_error("VOCAB_STATS temperature must be finite and positive");
+        throw std::runtime_error("VOCAB_LOCAL_STATS temperature must be finite and positive");
     const float inverseTemperature = 1.0f / temperature;
-    for (NnUint batchIndex = 0u; batchIndex < batchSize; ++batchIndex) {
+    for (NnUint batchIndex = threadIndex; batchIndex < batchSize; batchIndex += nThreads) {
         const float *input = (const float *)context->input[batchIndex];
         float *output = (float *)context->output[batchIndex];
-        if (config->mode == VOCAB_STATS_LOCAL) {
-            const float globalMax = ((const float *)context->buffers[config->globalMaxBufferIndex])[batchIndex];
-            const NnUint microshardSize = context->inputSize.x / config->microshardCount;
-            for (NnUint localShard = 0u; localShard < config->microshardCount; ++localShard) {
-                double denominator = 0.0;
-                double moment = 0.0;
-                float localMax = -INFINITY;
-                NnUint argmax = 0u;
-                const NnUint start = localShard * microshardSize;
-                const NnUint end = start + microshardSize;
-                for (NnUint token = start; token < end; ++token) {
-                    const float logit = input[token];
-                    if (!std::isfinite(logit))
-                        throw std::runtime_error("VOCAB_STATS logits must be finite");
-                    if (logit > localMax) {
-                        localMax = logit;
-                        argmax = token;
-                    }
-                    const double shifted = shiftedVocabLogit(logit, inverseTemperature, globalMax);
-                    const double weight = std::exp(shifted);
-                    denominator += weight;
-                    moment += weight * shifted;
-                }
-                float *record = output + localShard * NN_VOCAB_STATS_WIDTH;
-                record[0] = (float)denominator;
-                record[1] = (float)moment;
-                record[2] = localMax;
-                record[3] = (float)(config->vocabStart + argmax);
-                record[4] = -INFINITY;
-                if (config->useTargetTokens != 0u) {
-                    const float targetValue = ((const float *)context->pipes[config->targetTokensPipeIndex])[batchIndex];
-                    if (!std::isfinite(targetValue) || targetValue < 0.0f || std::floor(targetValue) != targetValue)
-                        throw std::runtime_error("VOCAB_STATS target token must be a non-negative integer");
-                    const NnUint target = (NnUint)targetValue;
-                    const NnUint globalStart = config->vocabStart + start;
-                    const NnUint globalEnd = config->vocabStart + end;
-                    if (target >= globalStart && target < globalEnd)
-                        record[4] = input[target - config->vocabStart];
-                }
-            }
-        } else {
-            const NnUint nMicroshards = context->inputSize.x / NN_VOCAB_STATS_WIDTH;
+        const float globalMax = ((const float *)context->buffers[config->globalMaxBufferIndex])[batchIndex];
+        const NnUint microshardSize = context->inputSize.x / config->microshardCount;
+        for (NnUint localShard = 0u; localShard < config->microshardCount; ++localShard) {
             double denominator = 0.0;
-            for (NnUint shard = 0u; shard < nMicroshards; ++shard) {
-                const float shardDenominator = input[shard * NN_VOCAB_STATS_WIDTH];
-                if (!(shardDenominator > 0.0f) || !std::isfinite(shardDenominator))
-                    throw std::runtime_error("VOCAB_STATS shard denominator must be finite and positive");
-                denominator += shardDenominator;
-            }
-            const float coin = ((const float *)context->pipes[config->samplingCoinsPipeIndex])[batchIndex];
-            if (!(coin >= 0.0f && coin < 1.0f))
-                throw std::runtime_error("VOCAB_STATS sampling coin must be in [0, 1)");
-            const double target = coin * denominator;
-            double preceding = 0.0;
-            NnUint owner = nMicroshards - 1u;
-            for (NnUint shard = 0u; shard < nMicroshards; ++shard) {
-                const double next = preceding + input[shard * NN_VOCAB_STATS_WIDTH];
-                if (target < next) {
-                    owner = shard;
-                    break;
-                }
-                preceding = next;
-            }
-            output[0] = -1.0f;
-            if (owner < config->microshardStart ||
-                owner >= config->microshardStart + config->microshardCount)
-                continue;
-            const NnSize3D &logitsSize = context->pipeConfigs[config->localLogitsPipeIndex].size;
-            const float *logits = (const float *)context->pipes[config->localLogitsPipeIndex] +
-                (NnSize)batchIndex * logitsSize.x;
-            const float globalMax = ((const float *)context->buffers[config->globalMaxBufferIndex])[batchIndex];
-            const double localTarget = target - preceding;
-            double cumulative = 0.0;
-            const NnUint microshardSize = logitsSize.x / config->microshardCount;
-            const NnUint localShard = owner - config->microshardStart;
+            double moment = 0.0;
+            float localMax = -INFINITY;
+            NnUint argmax = 0u;
             const NnUint start = localShard * microshardSize;
             const NnUint end = start + microshardSize;
-            NnUint sampled = end - 1u;
             for (NnUint token = start; token < end; ++token) {
-                cumulative += std::exp(shiftedVocabLogit(logits[token], inverseTemperature, globalMax));
-                if (localTarget < cumulative) {
-                    sampled = token;
-                    break;
+                const float logit = input[token];
+                if (!std::isfinite(logit))
+                    throw std::runtime_error("VOCAB_LOCAL_STATS logits must be finite");
+                if (logit > localMax) {
+                    localMax = logit;
+                    argmax = token;
                 }
+                const double shifted = shiftedVocabLogit(logit, inverseTemperature, globalMax);
+                const double weight = std::exp(shifted);
+                denominator += weight;
+                moment += weight * shifted;
             }
-            output[0] = (float)(config->vocabStart + sampled);
+            float *record = output + localShard * NN_VOCAB_STATS_WIDTH;
+            record[0] = (float)denominator;
+            record[1] = (float)moment;
+            record[2] = localMax;
+            record[3] = (float)(config->vocabStart + argmax);
+            record[4] = -INFINITY;
+            if (config->useTargetTokens != 0u) {
+                const float targetValue = ((const float *)context->pipes[config->targetTokensPipeIndex])[batchIndex];
+                if (!std::isfinite(targetValue) || targetValue < 0.0f || std::floor(targetValue) != targetValue)
+                    throw std::runtime_error("VOCAB_LOCAL_STATS target token must be a non-negative integer");
+                const NnUint target = (NnUint)targetValue;
+                const NnUint globalStart = config->vocabStart + start;
+                const NnUint globalEnd = config->vocabStart + end;
+                if (target >= globalStart && target < globalEnd)
+                    record[4] = input[target - config->vocabStart];
+            }
         }
+    }
+}
+
+static void vocabSampleForward(
+    NnUint nThreads,
+    NnUint threadIndex,
+    NnUint batchSize,
+    NnCpuOpContext *context) {
+    const NnVocabSampleOpConfig *config = (NnVocabSampleOpConfig *)context->opConfig;
+    const float temperature = *(const float *)context->pipes[config->temperaturePipeIndex];
+    if (!(temperature > 0.0f) || !std::isfinite(temperature))
+        throw std::runtime_error("VOCAB_SAMPLE temperature must be finite and positive");
+    const float inverseTemperature = 1.0f / temperature;
+    for (NnUint batchIndex = threadIndex; batchIndex < batchSize; batchIndex += nThreads) {
+        const float *input = (const float *)context->input[batchIndex];
+        float *output = (float *)context->output[batchIndex];
+        const NnUint nMicroshards = context->inputSize.x / NN_VOCAB_STATS_WIDTH;
+        double denominator = 0.0;
+        for (NnUint shard = 0u; shard < nMicroshards; ++shard) {
+            const float shardDenominator = input[shard * NN_VOCAB_STATS_WIDTH];
+            if (!(shardDenominator > 0.0f) || !std::isfinite(shardDenominator))
+                throw std::runtime_error("VOCAB_SAMPLE shard denominator must be finite and positive");
+            denominator += shardDenominator;
+        }
+        const float coin = ((const float *)context->pipes[config->samplingCoinsPipeIndex])[batchIndex];
+        if (!(coin >= 0.0f && coin < 1.0f))
+            throw std::runtime_error("VOCAB_SAMPLE sampling coin must be in [0, 1)");
+        const double target = coin * denominator;
+        double preceding = 0.0;
+        NnUint owner = nMicroshards - 1u;
+        for (NnUint shard = 0u; shard < nMicroshards; ++shard) {
+            const double next = preceding + input[shard * NN_VOCAB_STATS_WIDTH];
+            if (target < next) {
+                owner = shard;
+                break;
+            }
+            preceding = next;
+        }
+        output[0] = -1.0f;
+        if (owner < config->microshardStart ||
+            owner >= config->microshardStart + config->microshardCount)
+            continue;
+        const NnSize3D &logitsSize = context->pipeConfigs[config->localLogitsPipeIndex].size;
+        const float *logits = (const float *)context->pipes[config->localLogitsPipeIndex] +
+            (NnSize)batchIndex * logitsSize.x;
+        const float globalMax = ((const float *)context->buffers[config->globalMaxBufferIndex])[batchIndex];
+        const double localTarget = target - preceding;
+        double cumulative = 0.0;
+        const NnUint microshardSize = logitsSize.x / config->microshardCount;
+        const NnUint localShard = owner - config->microshardStart;
+        const NnUint start = localShard * microshardSize;
+        const NnUint end = start + microshardSize;
+        NnUint sampled = end - 1u;
+        for (NnUint token = start; token < end; ++token) {
+            cumulative += std::exp(shiftedVocabLogit(logits[token], inverseTemperature, globalMax));
+            if (localTarget < cumulative) {
+                sampled = token;
+                break;
+            }
+        }
+        output[0] = (float)(config->vocabStart + sampled);
     }
 }
 
@@ -2636,8 +2653,10 @@ NnCpuOpForwardInit getCpuOpForwardInit(NnOpCode code, NnOpQuantType quantType) {
         return initEmbeddingMixRescaleForward;
     if (code == OP_EMBEDDING_MIX_FINALIZE)
         return initEmbeddingMixFinalizeForward;
-    if (code == OP_VOCAB_STATS)
-        return initVocabStatsForward;
+    if (code == OP_VOCAB_LOCAL_STATS)
+        return initVocabLocalStatsForward;
+    if (code == OP_VOCAB_SAMPLE)
+        return initVocabSampleForward;
     return nullptr;
 }
 
@@ -2721,8 +2740,11 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     if (code == OP_EMBEDDING_MIX_FINALIZE) {
         if (quantType == F32_F32_F32) return embeddingMixFinalizeForward_F32_F32;
     }
-    if (code == OP_VOCAB_STATS) {
-        if (quantType == F32_F32_F32) return vocabStatsForward;
+    if (code == OP_VOCAB_LOCAL_STATS) {
+        if (quantType == F32_F32_F32) return vocabLocalStatsForward;
+    }
+    if (code == OP_VOCAB_SAMPLE) {
+        if (quantType == F32_F32_F32) return vocabSampleForward;
     }
     if (code == OP_TANH) {
         if (quantType == F32_F32_F32) return tanhForward_F32_F32;

@@ -885,7 +885,7 @@ void testTiedEmbedding_F32() {
 #define VOCAB_STATS_TEST_VOCAB 8
 #define VOCAB_STATS_TEST_SHARDS 2
 
-void testVocabStats_F32_F32() {
+void testVocabOps_F32_F32() {
     execute(
         [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *nodeBuilder, NnSegmentConfigBuilder *segmentBuilder) {
             const NnUint logitsPipeIndex = netBuilder->addPipe("logits",
@@ -904,18 +904,18 @@ void testVocabStats_F32_F32() {
                 size2D(F_32, N_BATCHES, 1u));
             const NnUint statsBufferIndex = nodeBuilder->addBuffer("stats",
                 size2D(F_32, N_BATCHES, VOCAB_STATS_TEST_SHARDS * NN_VOCAB_STATS_WIDTH));
-            segmentBuilder->addOp(OP_VOCAB_STATS, "vocab_stats_local", 0u,
+            segmentBuilder->addOp(OP_VOCAB_LOCAL_STATS, "vocab_local_stats", 0u,
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 pointerBatchConfig(SRC_BUFFER, statsBufferIndex), size0(),
-                NnVocabStatsOpConfig{VOCAB_STATS_LOCAL, globalMaxBufferIndex,
-                    temperaturePipeIndex, samplingCoinsPipeIndex, targetTokensPipeIndex,
-                    logitsPipeIndex, 10u, 0u, 0u, VOCAB_STATS_TEST_SHARDS, 1u});
-            segmentBuilder->addOp(OP_VOCAB_STATS, "vocab_stats_sample", 0u,
+                NnVocabLocalStatsOpConfig{globalMaxBufferIndex,
+                    temperaturePipeIndex, targetTokensPipeIndex, 10u,
+                    VOCAB_STATS_TEST_SHARDS, 1u});
+            segmentBuilder->addOp(OP_VOCAB_SAMPLE, "vocab_sample", 0u,
                 pointerBatchConfig(SRC_BUFFER, statsBufferIndex),
                 pointerBatchConfig(SRC_PIPE, sampledTokensPipeIndex), size0(),
-                NnVocabStatsOpConfig{VOCAB_STATS_SAMPLE, globalMaxBufferIndex,
-                    temperaturePipeIndex, samplingCoinsPipeIndex, targetTokensPipeIndex,
-                    logitsPipeIndex, 10u, 0u, 0u, VOCAB_STATS_TEST_SHARDS, 0u});
+                NnVocabSampleOpConfig{globalMaxBufferIndex,
+                    temperaturePipeIndex, samplingCoinsPipeIndex, logitsPipeIndex,
+                    10u, 0u, VOCAB_STATS_TEST_SHARDS});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             const NnUint batchSize = 2u;
@@ -977,7 +977,7 @@ void testVocabStats_F32_F32() {
             const NnUint secondBatchOffset = VOCAB_STATS_TEST_SHARDS * NN_VOCAB_STATS_WIDTH;
             assert(std::isinf(stats[secondBatchOffset + 4u]) && stats[secondBatchOffset + 4u] < 0.0f);
             assertFloat(secondBatchOffset + 9u, stats[secondBatchOffset + 9u], logits[8u + 5u], 0.00001f);
-            printOk("testVocabStats_F32_F32");
+            printOk("testVocabOps_F32_F32");
         });
 }
 
@@ -1962,14 +1962,14 @@ int main() {
     testReduceMax_F32_F32<false>();
     testReduceMax_F32_F32<true>();
     testEmbeddingMixRescale_F32_F32();
+    testVocabOps_F32_F32();
+
     testTiedEmbedding_F32<false>();
     testTiedEmbedding_F32<true, 32u, 32u>();
     testTiedEmbedding_F32<true, 256u, 96u, 128u, 9u, 9u>();
     testTiedEmbedding_F32<true, 128u, 32u, 65u, 3u, 9u>();
     testTiedEmbedding_F32<true, 256u, 2816u, 128u, 9u, 9u>();
     testTiedEmbedding_F32<true, 256u, 32u, 128u, 256u, 256u>();
-
-    testVocabStats_F32_F32();
 
     testDiffusionAttention_F32_F32<DIFFUSION_ATTENTION_ENCODER_CAUSAL, 0u, 2u, 2u>();
     testDiffusionAttention_F32_F32<DIFFUSION_ATTENTION_DECODER_BIDIRECTIONAL, 0u, 0u, 0u>();

@@ -942,6 +942,112 @@ void testMultiPlaneCast() {
     assert(output[13] == -1234.0f);
 }
 
+void testVocabOps() {
+    const NnUint batchCount = 4u;
+    const NnUint vocabSize = 8u;
+    const NnUint microshardCount = 2u;
+    const NnUint statsSize = microshardCount * NN_VOCAB_STATS_WIDTH;
+    const NnUint vocabStart = 10u;
+    float logits[batchCount * vocabSize];
+    float globalMax[batchCount];
+    float targetTokens[batchCount] = {10.0f, 13.0f, 16.0f, 17.0f};
+    float samplingCoins[batchCount] = {0.0f, 0.25f, 0.75f, 0.999f};
+    float stats[batchCount * statsSize];
+    float samples[batchCount];
+    const float temperature = 0.75f;
+    for (NnUint batch = 0u; batch < batchCount; ++batch) {
+        for (NnUint token = 0u; token < vocabSize; ++token)
+            logits[batch * vocabSize + token] = (float)token * 0.2f + (float)batch * 0.1f;
+        globalMax[batch] = logits[batch * vocabSize + vocabSize - 1u] / temperature;
+    }
+    std::fill(stats, stats + batchCount * statsSize, -1234.0f);
+    std::fill(samples, samples + batchCount, -1234.0f);
+
+    NnByte *pipes[] = {
+        (NnByte *)&temperature,
+        (NnByte *)targetTokens,
+        (NnByte *)samplingCoins,
+        (NnByte *)logits,
+    };
+    NnPipeConfig pipeConfigs[] = {
+        {NULL, size1D(F_32, 1u)},
+        {NULL, size2D(F_32, batchCount, 1u)},
+        {NULL, size2D(F_32, batchCount, 1u)},
+        {NULL, size2D(F_32, batchCount, vocabSize)},
+    };
+    NnByte *buffers[] = {(NnByte *)globalMax};
+    NnBufferConfig bufferConfigs[] = {{NULL, size2D(F_32, batchCount, 1u)}};
+    NnByte *logitRows[batchCount];
+    NnByte *statsRows[batchCount];
+    NnByte *sampleRows[batchCount];
+    for (NnUint batch = 0u; batch < batchCount; ++batch) {
+        logitRows[batch] = (NnByte *)(logits + batch * vocabSize);
+        statsRows[batch] = (NnByte *)(stats + batch * statsSize);
+        sampleRows[batch] = (NnByte *)(samples + batch);
+    }
+
+    NnVocabLocalStatsOpConfig localConfig = {0u, 0u, 1u, vocabStart, microshardCount, 1u};
+    NnCpuOpContext localContext = {};
+    localContext.nBatches = batchCount;
+    localContext.buffers = buffers;
+    localContext.bufferConfigs = bufferConfigs;
+    localContext.pipes = pipes;
+    localContext.pipeConfigs = pipeConfigs;
+    localContext.opConfig = &localConfig;
+    localContext.input = logitRows;
+    localContext.inputSize = size2D(F_32, batchCount, vocabSize);
+    localContext.output = statsRows;
+    localContext.outputSize = size2D(F_32, batchCount, statsSize);
+    localContext.weightSize = size0();
+    initVocabLocalStatsForward(&localContext);
+    for (NnUint thread = 3u; thread-- > 0u;)
+        vocabLocalStatsForward(3u, thread, batchCount, &localContext);
+
+    NnVocabSampleOpConfig sampleConfig = {0u, 0u, 2u, 3u, vocabStart, 0u, microshardCount};
+    NnCpuOpContext sampleContext = localContext;
+    sampleContext.opConfig = &sampleConfig;
+    sampleContext.input = statsRows;
+    sampleContext.inputSize = size2D(F_32, batchCount, statsSize);
+    sampleContext.output = sampleRows;
+    sampleContext.outputSize = size2D(F_32, batchCount, 1u);
+    initVocabSampleForward(&sampleContext);
+    for (NnUint thread = 3u; thread-- > 0u;)
+        vocabSampleForward(3u, thread, batchCount, &sampleContext);
+
+    float expectedSamples[batchCount];
+    for (NnUint batch = 0u; batch < batchCount; ++batch) {
+        double total = 0.0;
+        for (NnUint token = 0u; token < vocabSize; ++token)
+            total += std::exp(shiftedVocabLogit(
+                logits[batch * vocabSize + token], 1.0f / temperature, globalMax[batch]));
+        const double threshold = samplingCoins[batch] * total;
+        double cumulative = 0.0;
+        NnUint sampled = vocabSize - 1u;
+        for (NnUint token = 0u; token < vocabSize; ++token) {
+            cumulative += std::exp(shiftedVocabLogit(
+                logits[batch * vocabSize + token], 1.0f / temperature, globalMax[batch]));
+            if (threshold < cumulative) {
+                sampled = token;
+                break;
+            }
+        }
+        expectedSamples[batch] = (float)(vocabStart + sampled);
+        for (NnUint shard = 0u; shard < microshardCount; ++shard) {
+            const NnUint offset = batch * statsSize + shard * NN_VOCAB_STATS_WIDTH;
+            const NnUint shardEnd = (shard + 1u) * (vocabSize / microshardCount);
+            assert(stats[offset] > 0.0f && std::isfinite(stats[offset]));
+            assert(stats[offset + 2u] == logits[batch * vocabSize + shardEnd - 1u]);
+            assert(stats[offset + 3u] == (float)(vocabStart + shardEnd - 1u));
+            const NnUint target = (NnUint)targetTokens[batch] - vocabStart;
+            if (target >= shard * (vocabSize / microshardCount) && target < shardEnd)
+                assert(stats[offset + 4u] == logits[batch * vocabSize + target]);
+            else
+                assert(std::isinf(stats[offset + 4u]) && stats[offset + 4u] < 0.0f);
+        }
+    }
+    compare_F32("vocabOpsBatchParallel", samples, expectedSamples, batchCount, 0.0f);
+}
+
 void testLearnedExpertScale() {
     float probabilities[] = {0.1f, 0.4f, 0.4f, 0.1f};
     float scales[] = {1.0f, 2.0f, 3.0f, 1.0f};
@@ -998,6 +1104,7 @@ int main() {
     testProportionalRope();
     testScaledShardedEmbedding();
     testMultiPlaneCast();
+    testVocabOps();
     testLearnedExpertScale();
     return 0;
 }

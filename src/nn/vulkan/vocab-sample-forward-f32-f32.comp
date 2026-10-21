@@ -1,0 +1,84 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+
+#define VOCAB_STATS_WIDTH 5u
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
+layout(binding = 3) readonly uniform configBuffer {
+    uint globalMaxBufferIndex;
+    uint temperaturePipeIndex;
+    uint samplingCoinsPipeIndex;
+    uint localLogitsPipeIndex;
+    uint vocabStart;
+    uint microshardStart;
+    uint microshardCount;
+};
+layout(binding = 4) readonly buffer globalMaxBuffer { float globalMax[]; };
+layout(binding = 5) readonly buffer temperatureBuffer { float temperature[]; };
+layout(binding = 6) readonly buffer samplingCoinsBuffer { float samplingCoins[]; };
+layout(binding = 7) readonly buffer localLogitsBuffer { float localLogits[]; };
+
+void kahanAdd(const float value, inout float sum, inout float correction) {
+    const float adjusted = value - correction;
+    const float next = sum + adjusted;
+    correction = (next - sum) - adjusted;
+    sum = next;
+}
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const BatchInfo info = infos[batchIndex];
+    const uint nMicroshards = info.inputSizeX / VOCAB_STATS_WIDTH;
+    float denominator = 0.0f;
+    float denominatorCorrection = 0.0f;
+    for (uint shard = 0u; shard < nMicroshards; ++shard)
+        kahanAdd(x[info.inputOffset + shard * VOCAB_STATS_WIDTH], denominator, denominatorCorrection);
+    const float target = samplingCoins[batchIndex] * denominator;
+    float preceding = 0.0f;
+    uint owner = nMicroshards - 1u;
+    for (uint shard = 0u; shard < nMicroshards; ++shard) {
+        const float next = preceding + x[info.inputOffset + shard * VOCAB_STATS_WIDTH];
+        if (target < next) {
+            owner = shard;
+            break;
+        }
+        preceding = next;
+    }
+    y[info.outputOffset] = -1.0f;
+    if (owner < microshardStart || owner >= microshardStart + microshardCount)
+        return;
+
+    const uint localVocabSize = uint(localLogits.length()) / N_BATCHES;
+    const uint microshardSize = localVocabSize / microshardCount;
+    const uint localShard = owner - microshardStart;
+    const uint start = localShard * microshardSize;
+    const uint end = start + microshardSize;
+    const uint logitsOffset = batchIndex * localVocabSize;
+    const float inverseTemperature = 1.0f / temperature[0];
+    const float maximum = globalMax[batchIndex];
+    const float localTarget = target - preceding;
+    float cumulative = 0.0f;
+    float cumulativeCorrection = 0.0f;
+    uint sampled = end - 1u;
+    for (uint token = start; token < end; ++token) {
+        kahanAdd(exp(localLogits[logitsOffset + token] * inverseTemperature - maximum),
+            cumulative, cumulativeCorrection);
+        if (localTarget < cumulative) {
+            sampled = token;
+            break;
+        }
+    }
+    y[info.outputOffset] = float(vocabStart + sampled);
+}

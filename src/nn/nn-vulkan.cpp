@@ -587,8 +587,11 @@ static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuant
     if (opCode == OP_EMBEDDING_MIX_FINALIZE) {
         if (quantType == F32_F32_F32) return "embedding-mix-finalize-forward-f32-f32.spv";
     }
-    if (opCode == OP_VOCAB_STATS) {
-        if (quantType == F32_F32_F32) return "vocab-stats-forward-f32-f32.spv";
+    if (opCode == OP_VOCAB_LOCAL_STATS) {
+        if (quantType == F32_F32_F32) return "vocab-local-stats-forward-f32-f32.spv";
+    }
+    if (opCode == OP_VOCAB_SAMPLE) {
+        if (quantType == F32_F32_F32) return "vocab-sample-forward-f32-f32.spv";
     }
     if (opCode == OP_RMS_NORM) {
         if (quantType == F32_F32_F32) {
@@ -734,12 +737,18 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->vocabularyMaxPipeIndex)});
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->globalMaxBufferIndex)});
         } break;
-        case OP_VOCAB_STATS: {
-            const NnVocabStatsOpConfig *config = (NnVocabStatsOpConfig *)opConfig->config;
+        case OP_VOCAB_LOCAL_STATS: {
+            const NnVocabLocalStatsOpConfig *config =
+                (NnVocabLocalStatsOpConfig *)opConfig->config;
+            a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->globalMaxBufferIndex)});
+            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
+            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->targetTokensPipeIndex)});
+        } break;
+        case OP_VOCAB_SAMPLE: {
+            const NnVocabSampleOpConfig *config = (NnVocabSampleOpConfig *)opConfig->config;
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->globalMaxBufferIndex)});
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->samplingCoinsPipeIndex)});
-            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->targetTokensPipeIndex)});
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->localLogitsPipeIndex)});
         } break;
         case OP_MOE_GATE: {
@@ -903,10 +912,10 @@ static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const
     if (opConfig->code == OP_TIED_EMBEDDING_REDUCE ||
         opConfig->code == OP_REDUCE_MAX)
         return 1u;
-    if (opConfig->code == OP_VOCAB_STATS) {
-        const NnVocabStatsOpConfig *config = (NnVocabStatsOpConfig *)opConfig->config;
-        return config->mode == VOCAB_STATS_LOCAL ? config->microshardCount : 1u;
-    }
+    if (opConfig->code == OP_VOCAB_LOCAL_STATS)
+        return ((NnVocabLocalStatsOpConfig *)opConfig->config)->microshardCount;
+    if (opConfig->code == OP_VOCAB_SAMPLE)
+        return 1u;
     if (opConfig->code == OP_INV_RMS)
         return ((NnInvRmsOpConfig *)opConfig->config)->nColumns;
     if (opConfig->code == OP_SHIFT) {

@@ -91,7 +91,8 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_DIFFUSION_ATTENTION) return "DIFFUSION_ATTENTION";
     if (code == OP_TIED_EMBEDDING_PARTIAL) return "TIED_EMBEDDING_PARTIAL";
     if (code == OP_TANH) return "TANH";
-    if (code == OP_VOCAB_STATS) return "VOCAB_STATS";
+    if (code == OP_VOCAB_LOCAL_STATS) return "VOCAB_LOCAL_STATS";
+    if (code == OP_VOCAB_SAMPLE) return "VOCAB_SAMPLE";
     if (code == OP_TIED_EMBEDDING_REDUCE) return "TIED_EMBEDDING_REDUCE";
     if (code == OP_REDUCE_MAX) return "REDUCE_MAX";
     if (code == OP_EMBEDDING_MIX_RESCALE) return "EMBEDDING_MIX_RESCALE";

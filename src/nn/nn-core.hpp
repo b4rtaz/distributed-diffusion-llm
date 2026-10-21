@@ -98,7 +98,8 @@ enum NnOpCode {
     OP_DIFFUSION_ATTENTION,
     OP_TIED_EMBEDDING_PARTIAL,
     OP_TANH,
-    OP_VOCAB_STATS,
+    OP_VOCAB_LOCAL_STATS,
+    OP_VOCAB_SAMPLE,
     OP_TIED_EMBEDDING_REDUCE,
     OP_REDUCE_MAX,
     OP_EMBEDDING_MIX_RESCALE,
@@ -392,24 +393,24 @@ typedef struct {
 #define NN_VOCAB_STATS_WIDTH 5u
 #define NN_VOCAB_MICROSHARDS 8u
 
-enum NnVocabStatsMode {
-    VOCAB_STATS_LOCAL = 0,
-    VOCAB_STATS_SAMPLE = 1,
-};
+typedef struct {
+    NnUint globalMaxBufferIndex;
+    NnUint temperaturePipeIndex;
+    NnUint targetTokensPipeIndex;
+    NnUint vocabStart;
+    NnUint microshardCount;
+    NnUint useTargetTokens;
+} NnVocabLocalStatsOpConfig;
 
 typedef struct {
-    NnVocabStatsMode mode;
     NnUint globalMaxBufferIndex;
     NnUint temperaturePipeIndex;
     NnUint samplingCoinsPipeIndex;
-    NnUint targetTokensPipeIndex;
     NnUint localLogitsPipeIndex;
     NnUint vocabStart;
-    NnUint nodeIndex;
     NnUint microshardStart;
     NnUint microshardCount;
-    NnUint useTargetTokens;
-} NnVocabStatsOpConfig;
+} NnVocabSampleOpConfig;
 
 // utility functions
 
