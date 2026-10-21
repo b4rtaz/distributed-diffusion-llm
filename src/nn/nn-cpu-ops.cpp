@@ -65,6 +65,51 @@ static inline float32x4_t expf_neon(float32x4_t x) {
     float32x4_t two_k = vreinterpretq_f32_s32(pow2k);
     return vmulq_f32(p, two_k);
 }
+
+static inline float32x4_t tiedEmbeddingExp_NEON(float32x4_t x) {
+    const float32x4_t minimum = vdupq_n_f32(-87.33654475f);
+    const float32x4_t maximum = vdupq_n_f32(88.0f);
+    const float32x4_t invLn2 = vdupq_n_f32(1.44269504088896341f);
+    const float32x4_t ln2High = vdupq_n_f32(0.693359375f);
+    const float32x4_t ln2Low = vdupq_n_f32(-2.12194440e-4f);
+
+    x = vmaxq_f32(minimum, vminq_f32(maximum, x));
+    const float32x4_t z = vfmaq_f32(vdupq_n_f32(0.5f), x, invLn2);
+    int32x4_t exponent = vcvtq_s32_f32(z);
+    const float32x4_t truncated = vcvtq_f32_s32(exponent);
+    exponent = vaddq_s32(exponent, vreinterpretq_s32_u32(vcltq_f32(z, truncated)));
+    const float32x4_t exponentF32 = vcvtq_f32_s32(exponent);
+
+    float32x4_t reduced = vfmsq_f32(x, exponentF32, ln2High);
+    reduced = vfmsq_f32(reduced, exponentF32, ln2Low);
+
+    // Degree-seven Taylor polynomial on [-ln(2)/2, ln(2)/2]. The range
+    // reduction bounds the approximation error below float rounding noise.
+    float32x4_t polynomial = vdupq_n_f32(1.0f / 5040.0f);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.0f / 720.0f), polynomial, reduced);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.0f / 120.0f), polynomial, reduced);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), polynomial, reduced);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), polynomial, reduced);
+    polynomial = vfmaq_f32(vdupq_n_f32(0.5f), polynomial, reduced);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.0f), polynomial, reduced);
+    polynomial = vfmaq_f32(vdupq_n_f32(1.0f), polynomial, reduced);
+
+    const int32x4_t scaleBits = vshlq_n_s32(vaddq_s32(exponent, vdupq_n_s32(127)), 23);
+    return vmulq_f32(polynomial, vreinterpretq_f32_s32(scaleBits));
+}
+
+static inline float32x4_t tiedEmbeddingTanh_NEON(float32x4_t x) {
+    const uint32x4_t negative = vcltq_f32(x, vdupq_n_f32(0.0f));
+    const float32x4_t absolute = vabsq_f32(x);
+    const float32x4_t exponential = tiedEmbeddingExp_NEON(vmulq_n_f32(absolute, -2.0f));
+    const float32x4_t numerator = vsubq_f32(vdupq_n_f32(1.0f), exponential);
+    const float32x4_t denominator = vaddq_f32(vdupq_n_f32(1.0f), exponential);
+    float32x4_t reciprocal = vrecpeq_f32(denominator);
+    reciprocal = vmulq_f32(reciprocal, vrecpsq_f32(denominator, reciprocal));
+    reciprocal = vmulq_f32(reciprocal, vrecpsq_f32(denominator, reciprocal));
+    const float32x4_t result = vmulq_f32(numerator, reciprocal);
+    return vbslq_f32(negative, vnegq_f32(result), result);
+}
 #endif
 
 #if defined(__AVX2__)
@@ -954,13 +999,41 @@ static void tiedEmbeddingPartial_F32(
         const float *rawLogits = reinterpret_cast<const float *>(rawLogitRows[batch]);
         float *logits = reinterpret_cast<float *>(logitRows[batch]);
         float maximum = -INFINITY;
-        for (NnUint token = 0u; token < vocabSize; ++token) {
+        NnUint token = 0u;
+#if defined(__ARM_NEON)
+        const float32x4_t inverseSoftcapVec = vdupq_n_f32(1.0f / logitSoftcap);
+        const float32x4_t softcapVec = vdupq_n_f32(logitSoftcap);
+        const float32x4_t inverseTemperatureVec = vdupq_n_f32(inverseTemperature);
+        float32x4_t maximumVec = vdupq_n_f32(-INFINITY);
+        for (; token + 4u <= vocabSize; token += 4u) {
+            const float32x4_t raw = vld1q_f32(rawLogits + token);
+            const float32x4_t logit = vmulq_f32(
+                tiedEmbeddingTanh_NEON(vmulq_f32(raw, inverseSoftcapVec)), softcapVec);
+            vst1q_f32(logits + token, logit);
+            maximumVec = vmaxq_f32(maximumVec, vmulq_f32(logit, inverseTemperatureVec));
+        }
+        maximum = vmaxvq_f32(maximumVec);
+#endif
+        for (; token < vocabSize; ++token) {
             const float logit = logitSoftcap * tanhf(rawLogits[token] / logitSoftcap);
             logits[token] = logit;
             maximum = std::max(maximum, logit * inverseTemperature);
         }
         float denominator = 0.0f;
-        for (NnUint token = 0u; token < vocabSize; ++token) {
+        token = 0u;
+#if defined(__ARM_NEON)
+        const float32x4_t maximumVec2 = vdupq_n_f32(maximum);
+        float32x4_t denominatorVec = vdupq_n_f32(0.0f);
+        for (; token + 4u <= vocabSize; token += 4u) {
+            const float32x4_t logit = vld1q_f32(logits + token);
+            const float32x4_t probability = tiedEmbeddingExp_NEON(
+                vsubq_f32(vmulq_f32(logit, inverseTemperatureVec), maximumVec2));
+            vst1q_f32(probabilities + batch * vocabSize + token, probability);
+            denominatorVec = vaddq_f32(denominatorVec, probability);
+        }
+        denominator = vaddvq_f32(denominatorVec);
+#endif
+        for (; token < vocabSize; ++token) {
             const float probability = expf(logits[token] * inverseTemperature - maximum);
             probabilities[batch * vocabSize + token] = probability;
             denominator += probability;
