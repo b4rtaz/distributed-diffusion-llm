@@ -154,6 +154,54 @@ static inline __m256 expf_avx2(__m256 x) {
     __m256 two_n = _mm256_castsi256_ps(exponent);
     return _mm256_mul_ps(p, two_n);
 }
+
+static inline __m256 tiedEmbeddingExp_AVX2(__m256 x) {
+    const __m256 minimum = _mm256_set1_ps(-87.33654475f);
+    const __m256 maximum = _mm256_set1_ps(88.0f);
+    const __m256 invLn2 = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 ln2High = _mm256_set1_ps(0.693359375f);
+    const __m256 ln2Low = _mm256_set1_ps(-2.12194440e-4f);
+
+    x = _mm256_max_ps(minimum, _mm256_min_ps(maximum, x));
+    const __m256 z = _mm256_fmadd_ps(x, invLn2, _mm256_set1_ps(0.5f));
+    __m256i exponent = _mm256_cvttps_epi32(z);
+    const __m256 truncated = _mm256_cvtepi32_ps(exponent);
+    exponent = _mm256_add_epi32(exponent,
+        _mm256_castps_si256(_mm256_cmp_ps(z, truncated, _CMP_LT_OQ)));
+    const __m256 exponentF32 = _mm256_cvtepi32_ps(exponent);
+
+    __m256 reduced = _mm256_fnmadd_ps(exponentF32, ln2High, x);
+    reduced = _mm256_fnmadd_ps(exponentF32, ln2Low, reduced);
+
+    __m256 polynomial = _mm256_set1_ps(1.0f / 5040.0f);
+    polynomial = _mm256_fmadd_ps(polynomial, reduced, _mm256_set1_ps(1.0f / 720.0f));
+    polynomial = _mm256_fmadd_ps(polynomial, reduced, _mm256_set1_ps(1.0f / 120.0f));
+    polynomial = _mm256_fmadd_ps(polynomial, reduced, _mm256_set1_ps(1.0f / 24.0f));
+    polynomial = _mm256_fmadd_ps(polynomial, reduced, _mm256_set1_ps(1.0f / 6.0f));
+    polynomial = _mm256_fmadd_ps(polynomial, reduced, _mm256_set1_ps(0.5f));
+    polynomial = _mm256_fmadd_ps(polynomial, reduced, _mm256_set1_ps(1.0f));
+    polynomial = _mm256_fmadd_ps(polynomial, reduced, _mm256_set1_ps(1.0f));
+
+    const __m256i scaleBits = _mm256_slli_epi32(
+        _mm256_add_epi32(exponent, _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(polynomial, _mm256_castsi256_ps(scaleBits));
+}
+
+static inline __m256 tiedEmbeddingTanh_AVX2(__m256 x) {
+    const __m256 negative = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_LT_OQ);
+    const __m256 absolute = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), x);
+    const __m256 exponential = tiedEmbeddingExp_AVX2(
+        _mm256_mul_ps(absolute, _mm256_set1_ps(-2.0f)));
+    const __m256 numerator = _mm256_sub_ps(_mm256_set1_ps(1.0f), exponential);
+    const __m256 denominator = _mm256_add_ps(_mm256_set1_ps(1.0f), exponential);
+    __m256 reciprocal = _mm256_rcp_ps(denominator);
+    reciprocal = _mm256_mul_ps(reciprocal,
+        _mm256_fnmadd_ps(denominator, reciprocal, _mm256_set1_ps(2.0f)));
+    reciprocal = _mm256_mul_ps(reciprocal,
+        _mm256_fnmadd_ps(denominator, reciprocal, _mm256_set1_ps(2.0f)));
+    const __m256 result = _mm256_mul_ps(numerator, reciprocal);
+    return _mm256_blendv_ps(result, _mm256_sub_ps(_mm256_setzero_ps(), result), negative);
+}
 #endif
 
 static float invRms_F32(const float *x, const unsigned int size, const float epsilon) {
@@ -776,34 +824,34 @@ void softmax_F32(float *x, const NnUint size) {
 }
 
 static float dotProduct_F32(const float *a, const float *b, const unsigned int size) {
+    float sum = 0.0f;
+    unsigned int s = 0;
 #if defined(__ARM_NEON)
-    assert(size % 4 == 0);
     float32x4_t fa;
     float32x4_t fb;
     float32x4_t fs = vmovq_n_f32(0);
-    for (unsigned int i = 0; i < size; i += 4) {
+    s = size - (size % 4);
+    for (unsigned int i = 0; i < s; i += 4) {
         fa = vld1q_f32(&a[i]);
         fb = vld1q_f32(&b[i]);
         fs = vmlaq_f32(fs, fa, fb);
     }
-    return vaddvq_f32(fs);
+    sum = vaddvq_f32(fs);
 #elif defined(__AVX2__)
-    assert(size % 8 == 0);
     __m256 a0, b0;
     __m256 u = _mm256_set1_ps(0.0f);
-    for (unsigned int i = 0; i < size; i += 8) {
+    s = size - (size % 8);
+    for (unsigned int i = 0; i < s; i += 8) {
         a0 = _mm256_loadu_ps(&a[i]);
         b0 = _mm256_loadu_ps(&b[i]);
         u = _mm256_fmadd_ps(a0, b0, u);
     }
-    return horizontalSum_avx2(u);
-#else
-    float sum = 0.0f;
-    for (unsigned int i = 0; i < size; i++) {
-        sum += a[i] * b[i];
+    sum = horizontalSum_avx2(u);
+#endif
+    for (; s < size; s++) {
+        sum += a[s] * b[s];
     }
     return sum;
-#endif
 }
 
 static void multiheadAtt_F32(
@@ -1013,6 +1061,20 @@ static void tiedEmbeddingPartial_F32(
             maximumVec = vmaxq_f32(maximumVec, vmulq_f32(logit, inverseTemperatureVec));
         }
         maximum = vmaxvq_f32(maximumVec);
+#elif defined(__AVX2__)
+        const __m256 inverseSoftcapVec = _mm256_set1_ps(1.0f / logitSoftcap);
+        const __m256 softcapVec = _mm256_set1_ps(logitSoftcap);
+        const __m256 inverseTemperatureVec = _mm256_set1_ps(inverseTemperature);
+        __m256 maximumVec = _mm256_set1_ps(-INFINITY);
+        for (; token + 8u <= vocabSize; token += 8u) {
+            const __m256 raw = _mm256_loadu_ps(rawLogits + token);
+            const __m256 logit = _mm256_mul_ps(
+                tiedEmbeddingTanh_AVX2(_mm256_mul_ps(raw, inverseSoftcapVec)), softcapVec);
+            _mm256_storeu_ps(logits + token, logit);
+            maximumVec = _mm256_max_ps(maximumVec,
+                _mm256_mul_ps(logit, inverseTemperatureVec));
+        }
+        maximum = horizontalMax_avx2(maximumVec);
 #endif
         for (; token < vocabSize; ++token) {
             const float logit = logitSoftcap * tanhf(rawLogits[token] / logitSoftcap);
@@ -1032,6 +1094,17 @@ static void tiedEmbeddingPartial_F32(
             denominatorVec = vaddq_f32(denominatorVec, probability);
         }
         denominator = vaddvq_f32(denominatorVec);
+#elif defined(__AVX2__)
+        const __m256 maximumVec2 = _mm256_set1_ps(maximum);
+        __m256 denominatorVec = _mm256_setzero_ps();
+        for (; token + 8u <= vocabSize; token += 8u) {
+            const __m256 logit = _mm256_loadu_ps(logits + token);
+            const __m256 probability = tiedEmbeddingExp_AVX2(
+                _mm256_sub_ps(_mm256_mul_ps(logit, inverseTemperatureVec), maximumVec2));
+            _mm256_storeu_ps(probabilities + batch * vocabSize + token, probability);
+            denominatorVec = _mm256_add_ps(denominatorVec, probability);
+        }
+        denominator = horizontalSum_avx2(denominatorVec);
 #endif
         for (; token < vocabSize; ++token) {
             const float probability = expf(logits[token] * inverseTemperature - maximum);

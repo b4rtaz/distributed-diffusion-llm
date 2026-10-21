@@ -771,6 +771,45 @@ void testTiedEmbedding(float temperature = 0.7f) {
     }
 }
 
+void testTiedEmbeddingPartialTail() {
+    const NnUint vocabSize = 67u;
+    const NnUint hiddenSize = 3u;
+    const NnUint physicalSize = 8u;
+    const float inverseTemperature = 1.0f / 0.7f;
+    const float softcap = 5.0f;
+    float rawLogits[vocabSize];
+    float logits[vocabSize];
+    float probabilities[vocabSize];
+    float partials[physicalSize];
+    NnByte *logitRows[] = {reinterpret_cast<NnByte *>(logits)};
+    NnByte *rawLogitRows[] = {reinterpret_cast<NnByte *>(rawLogits)};
+    for (NnUint i = 0u; i < vocabSize; ++i)
+        rawLogits[i] = (static_cast<int>(i) - 33) * 0.625f;
+
+    tiedEmbeddingPartial_F32(logitRows, rawLogitRows, probabilities, partials,
+        vocabSize, hiddenSize, physicalSize, 1u, inverseTemperature, softcap, 0u, 1u);
+
+    float expectedLogits[vocabSize];
+    float expectedProbabilities[vocabSize];
+    float maximum = -INFINITY;
+    for (NnUint i = 0u; i < vocabSize; ++i) {
+        expectedLogits[i] = softcap * tanhf(rawLogits[i] / softcap);
+        maximum = std::max(maximum, expectedLogits[i] * inverseTemperature);
+    }
+    float denominator = 0.0f;
+    for (NnUint i = 0u; i < vocabSize; ++i) {
+        expectedProbabilities[i] = expf(expectedLogits[i] * inverseTemperature - maximum);
+        denominator += expectedProbabilities[i];
+    }
+    compare_F32("tiedEmbeddingPartialTailLogits", logits, expectedLogits, vocabSize, 0.00001f);
+    compare_F32("tiedEmbeddingPartialTailProbabilities", probabilities,
+        expectedProbabilities, vocabSize, 0.000002f);
+    compare_F32("tiedEmbeddingPartialTailDenominator", partials + hiddenSize, &denominator,
+        1u, 0.00002f);
+    compare_F32("tiedEmbeddingPartialTailMaximum", partials + hiddenSize + 1u,
+        &maximum, 1u, 0.00001f);
+}
+
 void testPaddedShards() {
     const NnUint nodes[] = {1u, 2u, 4u, 8u};
     const NnUint expectedMoe[] = {704u, 352u, 192u, 96u};
@@ -945,6 +984,7 @@ int main() {
     testTanh();
     testShiftSlots();
     testTopk();
+    testTiedEmbeddingPartialTail();
     testDiffusionAttention();
     testTiedEmbedding<false>();
     testTiedEmbedding<true>();
