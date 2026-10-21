@@ -19,12 +19,16 @@ static void testModel(const char *path) {
     require(header.slidingRope.type == DIFFUSION_GEMMA_DEFAULT_ROPE, "sliding RoPE mismatch");
     require(header.fullRope.type == DIFFUSION_GEMMA_PROPORTIONAL_ROPE, "full RoPE mismatch");
     require(header.generation.maxDenoisingSteps > 0, "generation config mismatch");
-    std::size_t expectedTensorCount = 6;
+    std::size_t expectedTensorCount = 7;
     for (std::size_t layer = 0; layer < header.layerTypes.size(); ++layer)
         expectedTensorCount += header.layerTypes[layer] == DIFFUSION_GEMMA_SLIDING_ATTENTION ? 23 : 22;
     require(model.tensors().size() == expectedTensorCount, "model tensor count mismatch");
     const DiffusionGemmaTensor &embedding = model.tensor("token_embedding.weight");
     require(embedding.shape.size() == 2 && embedding.shape[0] == header.vocabSize && embedding.shape[1] == header.hiddenSize, "embedding shape mismatch");
+    const DiffusionGemmaTensor &mixEmbedding = model.tensor("token_embedding.mix_weight");
+    require(mixEmbedding.shape.size() == 2 && mixEmbedding.shape[0] == header.hiddenSize &&
+        mixEmbedding.shape[1] == header.vocabSize && mixEmbedding.type == embedding.type,
+        "mix embedding shape mismatch");
     std::vector<unsigned char> bytes(static_cast<std::size_t>(std::min<std::uint64_t>(embedding.length, 64)));
     model.readTensorBytes(embedding.name, 0, bytes.data(), bytes.size());
     bool rejected = false;

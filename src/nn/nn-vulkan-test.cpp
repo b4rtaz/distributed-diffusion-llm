@@ -739,10 +739,11 @@ void testTiedEmbedding_F32() {
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 size2D(quantized ? F_Q40 : F_32, hiddenSize, vocabSize),
                 NnMatmulOpConfig{0u, 0u, 0u});
-            segmentBuilder->addOp(OP_TIED_EMBEDDING_PARTIAL, "tied_embedding_weight", 0u,
+            segmentBuilder->addOp(OP_TIED_EMBEDDING_PARTIAL,
+                "tied_embedding_mix_weight", 0u,
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
                 pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
-                size2D(quantized ? F_Q40 : F_32, vocabSize, hiddenSize),
+                size2D(quantized ? F_Q40 : F_32, hiddenSize, vocabSize),
                 NnTiedEmbeddingPartialOpConfig{temperaturePipeIndex,
                     partialBufferIndex, physicalSize, tileSize, tileCount,
                     hiddenSize, 2.5f});
@@ -784,6 +785,12 @@ void testTiedEmbedding_F32() {
                     embedding[token * hiddenSize + h] =
                         float(int((token + 1u) * (h + 5u) % 19u) - 9) * 0.02f;
             std::vector<float> effectiveEmbedding(vocabSize * hiddenSize);
+            std::vector<float> effectiveMixEmbedding(vocabSize * hiddenSize);
+            std::vector<float> transposed(vocabSize * hiddenSize);
+            for (NnUint token = 0u; token < vocabSize; ++token)
+                for (NnUint h = 0u; h < hiddenSize; ++h)
+                    transposed[h * vocabSize + token] =
+                        embedding[token * hiddenSize + h];
             if (quantized) {
                 std::vector<NnBlockQ40> packed(vocabSize * hiddenSize / Q40_BLOCK_SIZE);
                 quantizeF32toQ40(embedding.data(), packed.data(),
@@ -792,10 +799,23 @@ void testTiedEmbedding_F32() {
                     vocabSize * hiddenSize, 1u, 0u);
                 executor->loadWeight("tied_embedding_weight", 0u, 0u,
                     packed.size() * sizeof(NnBlockQ40), (NnByte *)packed.data());
+                std::vector<float> effectiveTransposed(vocabSize * hiddenSize);
+                quantizeF32toQ40(transposed.data(), packed.data(), transposed.size(), 1u, 0u);
+                dequantizeQ40toF32(packed.data(), effectiveTransposed.data(),
+                    effectiveTransposed.size(), 1u, 0u);
+                for (NnUint token = 0u; token < vocabSize; ++token)
+                    for (NnUint h = 0u; h < hiddenSize; ++h)
+                        effectiveMixEmbedding[token * hiddenSize + h] =
+                            effectiveTransposed[h * vocabSize + token];
+                executor->loadWeight("tied_embedding_mix_weight", 0u, 0u,
+                    packed.size() * sizeof(NnBlockQ40), (NnByte *)packed.data());
             } else {
                 effectiveEmbedding = embedding;
+                effectiveMixEmbedding = embedding;
                 executor->loadWeight("tied_embedding_weight", 0u, 0u,
                     embedding.size() * sizeof(float), (NnByte *)embedding.data());
+                executor->loadWeight("tied_embedding_mix_weight", 0u, 0u,
+                    transposed.size() * sizeof(float), (NnByte *)transposed.data());
             }
 
             std::vector<float> expected(batchSize * hiddenSize);
@@ -822,7 +842,7 @@ void testTiedEmbedding_F32() {
                     float numerator = 0.0f;
                     for (NnUint token = 0u; token < vocabSize; ++token)
                         numerator += probabilities[token] *
-                            effectiveEmbedding[token * hiddenSize + h];
+                            effectiveMixEmbedding[token * hiddenSize + h];
                     expected[batch * hiddenSize + h] = 2.0f * numerator / denominator;
                 }
             }
@@ -1924,11 +1944,11 @@ int main() {
     testReduceMax_F32_F32<true>();
     testEmbeddingMixRescale_F32_F32();
     testTiedEmbedding_F32<false>();
-    testTiedEmbedding_F32<true>();
-    testTiedEmbedding_F32<true, 257u, 96u, 128u, 9u, 9u>();
-    testTiedEmbedding_F32<true, 131u, 32u, 65u, 3u, 9u>();
-    testTiedEmbedding_F32<true, 257u, 2816u, 128u, 9u, 9u>();
-    testTiedEmbedding_F32<true, 257u, 32u, 128u, 256u, 256u>();
+    testTiedEmbedding_F32<true, 32u, 32u>();
+    testTiedEmbedding_F32<true, 256u, 96u, 128u, 9u, 9u>();
+    testTiedEmbedding_F32<true, 128u, 32u, 65u, 3u, 9u>();
+    testTiedEmbedding_F32<true, 256u, 2816u, 128u, 9u, 9u>();
+    testTiedEmbedding_F32<true, 256u, 32u, 128u, 256u, 256u>();
 
     testVocabStats_F32_F32();
 

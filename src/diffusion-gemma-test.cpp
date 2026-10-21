@@ -90,6 +90,29 @@ static void testCpuGraphInitialization() {
     releaseDiffusionGemmaGraph(&graph);
 }
 
+static void testMixWeightLayouts() {
+    const DiffusionGemmaWeightType types[] = {DIFFUSION_GEMMA_F32, DIFFUSION_GEMMA_Q40};
+    for (NnUint type = 0u; type < 2u; ++type) {
+        DiffusionGemmaHeader h = header(false);
+        h.weightType = types[type];
+        DiffusionGemmaGraph graph = buildDiffusionGemmaGraph(h, 2u, 4u, 16u);
+        for (NnUint node = 0u; node < 2u; ++node) {
+            const DiffusionGemmaWeightBinding &canonical =
+                binding(graph, node, "token_embedding.weight");
+            const DiffusionGemmaWeightBinding &mix =
+                binding(graph, node, "token_embedding.mix_weight");
+            assert(canonical.shard == DIFFUSION_GEMMA_WEIGHT_VOCAB_ROWS);
+            assert(mix.shard == DIFFUSION_GEMMA_WEIGHT_COLUMNS);
+            assert(mix.tensorName == "token_embedding.mix_weight");
+            assert(mix.logicalStart == node * 32u && mix.logicalSize == 32u);
+            const NnSize3D &size = graph.nodes[node].weights[mix.weightIndex].size;
+            assert(size.floatType == (type == 0u ? F_32 : F_Q40));
+            assert(size.y == h.hiddenSize && size.x == 32u);
+        }
+        releaseDiffusionGemmaGraph(&graph);
+    }
+}
+
 static void testLoadedModel(const char *path) {
     DiffusionGemmaModelFile model(path);
     DiffusionGemmaGraph graph = buildDiffusionGemmaGraph(
@@ -135,6 +158,7 @@ int main(int argc, char **argv) {
     testProductionShards(4u);
     testProductionShards(8u);
     testCpuGraphInitialization();
+    testMixWeightLayouts();
     for (int i = 1; i < argc; ++i)
         testLoadedModel(argv[i]);
     return 0;

@@ -306,6 +306,7 @@ void DiffusionGemmaModelFile::validateManifest() const {
     const std::uint64_t h = header_.hiddenSize, d = header_.denseIntermediateSize, m = header_.moeIntermediateSize;
     const std::uint64_t e = header_.expertCount;
     requireTensor("token_embedding.weight", shape({header_.vocabSize, h}), matrixType);
+    requireTensor("token_embedding.mix_weight", shape({h, header_.vocabSize}), matrixType);
     requireTensor("self_conditioning.pre_norm.weight", shape({h}), DIFFUSION_GEMMA_F32);
     requireTensor("self_conditioning.gate_proj.weight", shape({d, h}), matrixType);
     requireTensor("self_conditioning.up_proj.weight", shape({d, h}), matrixType);
@@ -406,6 +407,17 @@ void copyColumns(
             const std::uint64_t sourceElement = tensorRowOffset + (std::uint64_t)row * canonicalColumns + columnStart;
             model.readTensorBytes(tensor.name, sourceElement * sizeof(float),
                 output->data() + (std::size_t)row * physicalColumns * sizeof(float), rowBytes);
+        }
+        return;
+    }
+    if (columnStart % Q40_BLOCK_SIZE == 0u &&
+        logicalColumns == physicalColumns && logicalColumns % Q40_BLOCK_SIZE == 0u) {
+        const std::size_t rowBytes = static_cast<std::size_t>(elementBytes(tensor.type, logicalColumns));
+        for (NnUint row = 0u; row < rows; ++row) {
+            const std::uint64_t sourceElement =
+                tensorRowOffset + (std::uint64_t)row * canonicalColumns + columnStart;
+            readElements(model, tensor, sourceElement, logicalColumns,
+                output->data() + (std::size_t)row * rowBytes);
         }
         return;
     }

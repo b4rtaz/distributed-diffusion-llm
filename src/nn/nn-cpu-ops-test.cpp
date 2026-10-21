@@ -609,7 +609,7 @@ void testDiffusionAttention() {
     compare_F32("diffusionAttentionNoPrefix", actual, expected, queryLength * qHeads * headDim, 0.00001f);
 }
 
-template <bool quantized, NnUint vocab = 5u, NnUint hiddenSize = 32u,
+template <bool quantized, NnUint vocab = 64u, NnUint hiddenSize = 32u,
     NnUint batches = 3u, NnUint threads = 2u>
 void testTiedEmbedding(float temperature = 0.7f) {
     const NnUint physicalSize = hiddenSize + 8u;
@@ -632,13 +632,27 @@ void testTiedEmbedding(float temperature = 0.7f) {
 
     std::vector<float> effectiveHidden(hidden);
     std::vector<float> effectiveEmbedding(embedding);
+    std::vector<float> effectiveMixEmbedding(embedding);
+    std::vector<float> transposed(vocab * hiddenSize);
+    for (NnUint token = 0u; token < vocab; ++token)
+        for (NnUint h = 0u; h < hiddenSize; ++h)
+            transposed[h * vocab + token] = embedding[token * hiddenSize + h];
     std::vector<NnBlockQ80> quantHidden(batches * hiddenSize / Q80_BLOCK_SIZE);
     std::vector<NnBlockQ40> quantEmbedding(vocab * hiddenSize / Q40_BLOCK_SIZE);
+    std::vector<NnBlockQ40> quantMixEmbedding(vocab * hiddenSize / Q40_BLOCK_SIZE);
     if (quantized) {
         quantizeF32toQ80(hidden.data(), quantHidden.data(), hidden.size(), 1u, 0u);
         dequantizeQ80toF32(quantHidden.data(), effectiveHidden.data(), hidden.size(), 1u, 0u);
         quantizeF32toQ40(embedding.data(), quantEmbedding.data(), embedding.size(), 1u, 0u);
         dequantizeQ40toF32(quantEmbedding.data(), effectiveEmbedding.data(), embedding.size(), 1u, 0u);
+        std::vector<float> effectiveTransposed(vocab * hiddenSize);
+        quantizeF32toQ40(transposed.data(), quantMixEmbedding.data(), transposed.size(), 1u, 0u);
+        dequantizeQ40toF32(quantMixEmbedding.data(), effectiveTransposed.data(),
+            effectiveTransposed.size(), 1u, 0u);
+        for (NnUint token = 0u; token < vocab; ++token)
+            for (NnUint h = 0u; h < hiddenSize; ++h)
+                effectiveMixEmbedding[token * hiddenSize + h] =
+                    effectiveTransposed[h * vocab + token];
     }
 
     float rawLogits[batches][vocab];
@@ -668,14 +682,14 @@ void testTiedEmbedding(float temperature = 0.7f) {
         SPLIT_THREADS(batchStart, batchEnd, batches, threads, thread);
         if (quantized) {
             tiedEmbeddingPartial_F32_Q40_F32(
-                logitRows, rawLogitRows, quantEmbedding.data(), &partials[0][0],
+                logitRows, rawLogitRows, quantMixEmbedding.data(), &partials[0][0],
                 vocab, hiddenSize, physicalSize, tileCount,
                 1.0f / temperature, softcap, batchStart, batchEnd);
         } else {
             tiedEmbeddingPartial_F32_F32_F32(
-                logitRows, rawLogitRows, embedding.data(), &partials[0][0],
+                logitRows, rawLogitRows, transposed.data(), &partials[0][0],
                 vocab, hiddenSize, physicalSize, tileCount,
-                1.0f / temperature, softcap, batches, batchStart, batchEnd);
+                1.0f / temperature, softcap, batchStart, batchEnd);
         }
     };
     std::vector<std::thread> workers;
@@ -709,22 +723,40 @@ void testTiedEmbedding(float temperature = 0.7f) {
             0.00001f + std::fabs(maximum) * 0.000001f);
 
         float probabilities[vocab];
+        float effectiveProbabilities[vocab];
         float denominator = 0.0f;
         for (NnUint token = 0u; token < vocab; ++token) {
             probabilities[token] = expf(expectedLogits[token] / temperature - maximum);
             denominator += probabilities[token];
+        }
+        if (quantized) {
+            NnBlockQ80 quantizedProbabilities[vocab / Q80_BLOCK_SIZE];
+            quantizeF32toQ80(probabilities, quantizedProbabilities, vocab, 1u, 0u);
+            dequantizeQ80toF32(quantizedProbabilities, effectiveProbabilities, vocab, 1u, 0u);
+        } else {
+            std::copy(probabilities, probabilities + vocab, effectiveProbabilities);
         }
         float actualMix[hiddenSize];
         float expectedMix[hiddenSize];
         for (NnUint h = 0u; h < hiddenSize; ++h) {
             float expected = 0.0f;
             for (NnUint token = 0u; token < vocab; ++token)
-                expected += probabilities[token] * effectiveEmbedding[token * hiddenSize + h];
+                expected += effectiveProbabilities[token] *
+                    effectiveMixEmbedding[token * hiddenSize + h];
             expectedMix[h] = expected / denominator;
             actualMix[h] = mix[batch][h] / mix[batch][hiddenSize];
         }
         compare_F32(quantized ? "tiedEmbeddingMixQ40" : "tiedEmbeddingMixF32",
             actualMix, expectedMix, hiddenSize, 0.00001f);
+        if (quantized) {
+            for (NnUint h = 0u; h < hiddenSize; ++h) {
+                float canonical = 0.0f;
+                for (NnUint token = 0u; token < vocab; ++token)
+                    canonical += probabilities[token] *
+                        effectiveEmbedding[token * hiddenSize + h];
+                assert(std::fabs(expectedMix[h] - canonical / denominator) < 0.025f);
+            }
+        }
         for (NnUint h = hiddenSize + 1u; h < physicalSize; ++h)
             assert(mix[batch][h] == 0.0f);
     }
@@ -907,12 +939,12 @@ int main() {
     testDiffusionAttention();
     testTiedEmbedding<false>();
     testTiedEmbedding<true>();
-    // Multiple panels, a one-token tail, odd Q40 block count, and an uneven
+    // Multiple probability blocks, an odd hidden block count, and an uneven
     // thread split that exercises batched GEMM and its small-batch fallback.
-    testTiedEmbedding<true, 257u, 96u, 13u, 3u>();
+    testTiedEmbedding<true, 256u, 96u, 13u, 3u>();
     testTiedEmbedding<true, 128u, 64u, 8u, 2u>();
-    testTiedEmbedding<true, 257u, 96u, 13u, 3u>(0.001f);
-    testTiedEmbedding<true, 5u, 32u, 3u, 8u>();
+    testTiedEmbedding<true, 256u, 96u, 13u, 3u>(0.001f);
+    testTiedEmbedding<true, 32u, 32u, 3u, 8u>();
     testPaddedShards();
     testProportionalRope();
     testScaledShardedEmbedding();

@@ -1,8 +1,5 @@
 #version 450
 
-#extension GL_KHR_shader_subgroup_arithmetic : enable
-#extension GL_KHR_shader_subgroup_basic : enable
-
 #define N_THREADS 32
 
 layout(local_size_x = N_THREADS, local_size_y = 1, local_size_z = 1) in;
@@ -18,7 +15,7 @@ struct BatchInfo {
 };
 
 layout(binding = 0) readonly buffer inputBuffer { float inputLogits[]; };
-layout(binding = 1) writeonly buffer outputBuffer { float logits[]; };
+layout(binding = 1) buffer outputBuffer { float logits[]; };
 layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_BATCHES]; };
 layout(binding = 3) readonly buffer weightBuffer { float embedding[]; };
 layout(binding = 4) readonly uniform configBuffer {
@@ -33,12 +30,8 @@ layout(binding = 4) readonly uniform configBuffer {
 layout(binding = 5) writeonly buffer partialBuffer { float partials[]; };
 layout(binding = 6) readonly buffer temperatureBuffer { float temperature[]; };
 
-shared float decodedRow[HIDDEN_SIZE];
-shared float numerator[HIDDEN_SIZE];
-shared float runningMaximum;
+shared float maximum;
 shared float denominator;
-shared float oldScale;
-shared float valueScale;
 
 void main() {
     const uint tile = gl_WorkGroupID.x;
@@ -50,46 +43,32 @@ void main() {
     const uint partialOffset = (batch * tileCount + tile) * physicalSize;
     const float inverseTemperature = 1.0f / temperature[0];
 
-    for (uint h = lane; h < HIDDEN_SIZE; h += N_THREADS)
-        numerator[h] = 0.0f;
-    barrier();
-
-    for (uint token = tokenStart; token < tokenEnd; ++token) {
-        for (uint h = lane; h < HIDDEN_SIZE; h += N_THREADS)
-            decodedRow[h] = embedding[token * HIDDEN_SIZE + h];
-
-        if (lane == 0u) {
+    if (lane == 0u) {
+        maximum = -3.402823466e+38f;
+        for (uint token = tokenStart; token < tokenEnd; ++token) {
             const float rawLogit = inputLogits[info.inputOffset + token];
             const float logit = logitSoftcap * tanh(rawLogit / logitSoftcap);
             logits[info.outputOffset + token] = logit;
-            const float score = logit * inverseTemperature;
-            if (token == tokenStart) {
-                runningMaximum = score;
-                denominator = 1.0f;
-                oldScale = 0.0f;
-                valueScale = 1.0f;
-            } else if (score > runningMaximum) {
-                oldScale = exp(runningMaximum - score);
-                runningMaximum = score;
-                denominator = denominator * oldScale + 1.0f;
-                valueScale = 1.0f;
-            } else {
-                oldScale = 1.0f;
-                valueScale = exp(score - runningMaximum);
-                denominator += valueScale;
-            }
+            maximum = max(maximum, logit * inverseTemperature);
         }
-        barrier();
-
-        for (uint h = lane; h < HIDDEN_SIZE; h += N_THREADS)
-            numerator[h] = numerator[h] * oldScale + decodedRow[h] * valueScale;
+        denominator = 0.0f;
+        for (uint token = tokenStart; token < tokenEnd; ++token)
+            denominator += exp(logits[info.outputOffset + token] * inverseTemperature - maximum);
     }
+    barrier();
 
-    for (uint h = lane; h < HIDDEN_SIZE; h += N_THREADS)
-        partials[partialOffset + h] = numerator[h];
+    for (uint h = lane; h < HIDDEN_SIZE; h += N_THREADS) {
+        float numerator = 0.0f;
+        for (uint token = tokenStart; token < tokenEnd; ++token) {
+            const float probability = exp(
+                logits[info.outputOffset + token] * inverseTemperature - maximum);
+            numerator += embedding[h * info.outputSizeX + token] * probability;
+        }
+        partials[partialOffset + h] = numerator;
+    }
     if (lane == 0u) {
         partials[partialOffset + HIDDEN_SIZE] = denominator;
-        partials[partialOffset + HIDDEN_SIZE + 1u] = runningMaximum;
+        partials[partialOffset + HIDDEN_SIZE + 1u] = maximum;
     }
     for (uint h = HIDDEN_SIZE + 2u + lane; h < physicalSize; h += N_THREADS)
         partials[partialOffset + h] = 0.0f;

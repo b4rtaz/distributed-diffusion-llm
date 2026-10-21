@@ -69,6 +69,7 @@ struct NodeBuilder {
     NnUint globalEmbeddingMix;
 
     NnUint embeddingWeight;
+    NnUint embeddingMixWeight;
     NnUint scPreNormWeight;
     NnUint scGateWeight;
     NnUint scUpWeight;
@@ -211,6 +212,9 @@ struct NodeBuilder {
         const NnPaddedShard dense = denseShard();
         embeddingWeight = addWeight("token_embedding.weight", "token_embedding.weight",
             size2D(weightType, localVocab(), h.hiddenSize), DIFFUSION_GEMMA_WEIGHT_VOCAB_ROWS,
+            nodeIndex * localVocab(), localVocab(), localVocab());
+        embeddingMixWeight = addWeight("token_embedding.mix_weight", "token_embedding.mix_weight",
+            size2D(weightType, h.hiddenSize, localVocab()), DIFFUSION_GEMMA_WEIGHT_COLUMNS,
             nodeIndex * localVocab(), localVocab(), localVocab());
         scPreNormWeight = addWeight("self_conditioning.pre_norm.weight", "self_conditioning.pre_norm.weight",
             size1D(F_32, h.hiddenSize), DIFFUSION_GEMMA_WEIGHT_REPLICATED);
@@ -610,9 +614,10 @@ struct NodeBuilder {
             const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
             const NnUint tileSize = tiedEmbeddingTileSize();
             const NnUint tileCount = (localVocab() + tileSize - 1u) / tileSize;
-            maxima.addOp(OP_TIED_EMBEDDING_PARTIAL, "token_embedding.weight", 0u,
+            maxima.addOp(OP_TIED_EMBEDDING_PARTIAL, "token_embedding.mix_weight", 0u,
                 pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
-                size2D(weightType, localVocab(), h.hiddenSize), embeddingWeight,
+                size2D(weightType, h.hiddenSize, localVocab()),
+                embeddingMixWeight,
                 NnTiedEmbeddingPartialOpConfig{pipes.temperature, partialEmbeddingMix,
                     mixWidth, tileSize, tileCount, h.hiddenSize, h.logitSoftcap});
             maxima.addOp(OP_TIED_EMBEDDING_REDUCE, "embedding_mix.reduce_tiles", 0u,

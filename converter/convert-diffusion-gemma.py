@@ -51,6 +51,7 @@ class SourceTensor:
     shard_name: str
     shape: tuple[int, ...]
     tensor_type: int
+    transpose: bool = False
 
 
 class SafetensorsFile:
@@ -352,6 +353,21 @@ def build_manifest(source_dir: str, weight_type: str, layers_value: str | None):
             )
         )
 
+    embedding = manifest[0]
+    if embedding.output_name != "token_embedding.weight":
+        raise AssertionError("token embedding must be the first converted tensor")
+    manifest.insert(
+        1,
+        SourceTensor(
+            "token_embedding.mix_weight",
+            embedding.source_key,
+            embedding.shard_name,
+            (hidden, vocab),
+            embedding.tensor_type,
+            True,
+        ),
+    )
+
     converted_text = dict(text)
     converted_text["num_hidden_layers"] = len(selected_layers)
     converted_text["layer_types"] = [text["layer_types"][layer] for layer in selected_layers]
@@ -376,32 +392,97 @@ def build_manifest(source_dir: str, weight_type: str, layers_value: str | None):
     return metadata, manifest, shard_readers, required_shards
 
 
-def write_q40(reader: SafetensorsFile, key: str, output: BinaryIO) -> int:
+def quantize_q40(values):
     np = require_numpy()
+    groups = np.ascontiguousarray(values, dtype=np.float32).reshape(-1, 32)
+    maximum = groups.max(axis=1)
+    minimum = groups.min(axis=1)
+    delta = np.where(-minimum > maximum, minimum, maximum) / -8.0
+    inverse = np.zeros_like(delta, dtype=np.float32)
+    np.divide(1.0, delta, out=inverse, where=delta != 0)
+    quantized = np.clip((groups * inverse[:, None] + 8.5).astype(np.int32), 0, 15).astype(np.uint8)
+    packed = quantized[:, :16] | (quantized[:, 16:] << 4)
+    records = np.empty((groups.shape[0], 18), dtype=np.uint8)
+    records[:, :2] = delta.astype("<f2").view(np.uint8).reshape(-1, 2)
+    records[:, 2:] = packed
+    return records
+
+
+def write_q40(reader: SafetensorsFile, key: str, output: BinaryIO) -> int:
     written = 0
     for chunk in reader.iter_f32(key):
         if chunk.size % 32:
             raise ValueError(f"tensor {key} Q40 chunk is not block aligned")
-        groups = chunk.reshape(-1, 32)
-        maximum = groups.max(axis=1)
-        minimum = groups.min(axis=1)
-        delta = np.where(-minimum > maximum, minimum, maximum) / -8.0
-        inverse = np.zeros_like(delta, dtype=np.float32)
-        np.divide(1.0, delta, out=inverse, where=delta != 0)
-        quantized = np.clip((groups * inverse[:, None] + 8.5).astype(np.int32), 0, 15).astype(np.uint8)
-        packed = quantized[:, :16] | (quantized[:, 16:] << 4)
-        records = np.empty((groups.shape[0], 18), dtype=np.uint8)
-        records[:, :2] = delta.astype("<f2").view(np.uint8).reshape(-1, 2)
-        records[:, 2:] = packed
-        data = records.tobytes()
+        data = quantize_q40(chunk).tobytes()
         output.write(data)
         written += len(data)
     return written
 
 
+def write_transposed(
+    reader: SafetensorsFile,
+    key: str,
+    output_shape: tuple[int, ...],
+    tensor_type: int,
+    output: BinaryIO,
+    tile_rows: int = 4096,
+) -> int:
+    np = require_numpy()
+    start, _, dtype, source_shape = reader._bounds(key)
+    if len(source_shape) != 2 or output_shape != (source_shape[1], source_shape[0]):
+        raise ValueError(f"tensor {key} cannot be transposed from {source_shape} to {output_shape}")
+    output_rows, output_columns = output_shape
+    if tensor_type == TensorType.Q40 and output_columns % 32:
+        raise ValueError(f"transposed Q40 tensor {key} is not block aligned by row")
+
+    source_dtype = {"F32": "<f4", "F16": "<f2", "BF16": "<u2"}[dtype]
+    source = np.memmap(
+        reader.path,
+        dtype=np.dtype(source_dtype),
+        mode="r",
+        offset=start,
+        shape=source_shape,
+    )
+    tensor_start = output.tell()
+    total_bytes = stored_size(output_shape, tensor_type)
+    output.seek(tensor_start + total_bytes - 1)
+    output.write(b"\x00")
+    if tensor_type == TensorType.F32:
+        row_bytes = output_columns * 4
+    else:
+        row_bytes = output_columns // 32 * 18
+
+    for row_start in range(0, source_shape[0], tile_rows):
+        row_end = min(row_start + tile_rows, source_shape[0])
+        if tensor_type == TensorType.Q40 and (row_start % 32 or (row_end - row_start) % 32):
+            raise ValueError(f"transposed Q40 tile for {key} is not block aligned")
+        source_tile = source[row_start:row_end]
+        if dtype == "BF16":
+            source_tile = (source_tile.astype(np.uint32) << 16).view(np.float32)
+        else:
+            source_tile = source_tile.astype(np.float32, copy=False)
+        transposed = np.ascontiguousarray(source_tile.T)
+        if tensor_type == TensorType.F32:
+            encoded = transposed.astype("<f4", copy=False).view(np.uint8).reshape(output_rows, -1)
+            tile_offset = row_start * 4
+        else:
+            encoded = quantize_q40(transposed).reshape(output_rows, -1)
+            tile_offset = row_start // 32 * 18
+        for row in range(output_rows):
+            output.seek(tensor_start + row * row_bytes + tile_offset)
+            output.write(encoded[row].tobytes())
+    output.seek(tensor_start + total_bytes)
+    return total_bytes
+
+
 def make_tensor_spec(tensor: SourceTensor, readers: dict[str, SafetensorsFile]) -> TensorSpec:
     reader = readers[tensor.shard_name]
-    if tensor.tensor_type == TensorType.F32:
+    if tensor.transpose:
+        def write(output: BinaryIO, reader=reader, tensor=tensor) -> int:
+            return write_transposed(
+                reader, tensor.source_key, tensor.shape, tensor.tensor_type, output
+            )
+    elif tensor.tensor_type == TensorType.F32:
         def write(output: BinaryIO, reader=reader, key=tensor.source_key) -> int:
             return reader.write_f32(key, output)
     else:
@@ -422,6 +503,7 @@ def manifest_json(metadata: dict, tensors: Sequence[SourceTensor], shards: Seque
                 "shape": list(tensor.shape),
                 "type": "q40" if tensor.tensor_type == TensorType.Q40 else "f32",
                 "bytes": stored_size(tensor.shape, tensor.tensor_type),
+                "transform": "transpose" if tensor.transpose else "identity",
             }
             for tensor in tensors
         ],
