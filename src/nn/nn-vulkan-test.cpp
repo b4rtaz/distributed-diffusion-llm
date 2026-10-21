@@ -851,11 +851,18 @@ void testTiedEmbedding_F32() {
                     maximum = std::max(maximum, logit / temperature);
                 }
                 float denominator = 0.0f;
-                float probabilities[vocabSize];
+                std::vector<float> probabilities(vocabSize);
                 for (NnUint token = 0u; token < vocabSize; ++token) {
                     probabilities[token] = expf(
                         expectedLogits[batch * vocabSize + token] / temperature - maximum);
                     denominator += probabilities[token];
+                }
+                if (quantized) {
+                    std::vector<NnBlockQ80> packedProbabilities(vocabSize / Q80_BLOCK_SIZE);
+                    quantizeF32toQ80(probabilities.data(), packedProbabilities.data(),
+                        vocabSize, 1u, 0u);
+                    dequantizeQ80toF32(packedProbabilities.data(), probabilities.data(),
+                        vocabSize, 1u, 0u);
                 }
                 for (NnUint h = 0u; h < hiddenSize; ++h) {
                     float numerator = 0.0f;
