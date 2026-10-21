@@ -1048,6 +1048,95 @@ void testVocabOps() {
     compare_F32("vocabOpsBatchParallel", samples, expectedSamples, batchCount, 0.0f);
 }
 
+void testVocabLocalStatsVectorTail() {
+    const NnUint batchCount = 2u;
+    const NnUint vocabSize = 34u;
+    const NnUint microshardCount = 2u;
+    const NnUint microshardSize = vocabSize / microshardCount;
+    const NnUint statsSize = microshardCount * NN_VOCAB_STATS_WIDTH;
+    const NnUint vocabStart = 100u;
+    const float temperature = 0.7f;
+    float logits[batchCount * vocabSize];
+    float globalMax[batchCount];
+    float targetTokens[batchCount] = {116.0f, 133.0f};
+    float stats[batchCount * statsSize];
+    for (NnUint batch = 0u; batch < batchCount; ++batch) {
+        for (NnUint token = 0u; token < vocabSize; ++token) {
+            const int pattern = static_cast<int>((token * 19u + batch * 7u) % 31u) - 15;
+            logits[batch * vocabSize + token] = static_cast<float>(pattern) * 0.37f;
+        }
+        // Exercise stable argmax tie handling in both a full vector and tail.
+        logits[batch * vocabSize + 3u] = 9.0f + batch;
+        logits[batch * vocabSize + 16u] = 9.0f + batch;
+        logits[batch * vocabSize + 20u] = 10.0f + batch;
+        logits[batch * vocabSize + 33u] = 10.0f + batch;
+        globalMax[batch] = (10.0f + batch) / temperature;
+    }
+
+    NnByte *pipes[] = {(NnByte *)&temperature, (NnByte *)targetTokens};
+    NnPipeConfig pipeConfigs[] = {
+        {NULL, size1D(F_32, 1u)},
+        {NULL, size2D(F_32, batchCount, 1u)},
+    };
+    NnByte *buffers[] = {(NnByte *)globalMax};
+    NnBufferConfig bufferConfigs[] = {{NULL, size2D(F_32, batchCount, 1u)}};
+    NnByte *logitRows[batchCount];
+    NnByte *statsRows[batchCount];
+    for (NnUint batch = 0u; batch < batchCount; ++batch) {
+        logitRows[batch] = (NnByte *)(logits + batch * vocabSize);
+        statsRows[batch] = (NnByte *)(stats + batch * statsSize);
+    }
+    NnVocabLocalStatsOpConfig config = {0u, 0u, 1u, vocabStart, microshardCount, 1u};
+    NnCpuOpContext context = {};
+    context.nBatches = batchCount;
+    context.buffers = buffers;
+    context.bufferConfigs = bufferConfigs;
+    context.pipes = pipes;
+    context.pipeConfigs = pipeConfigs;
+    context.opConfig = &config;
+    context.input = logitRows;
+    context.inputSize = size2D(F_32, batchCount, vocabSize);
+    context.output = statsRows;
+    context.outputSize = size2D(F_32, batchCount, statsSize);
+    context.weightSize = size0();
+    initVocabLocalStatsForward(&context);
+    vocabLocalStatsForward(1u, 0u, batchCount, &context);
+
+    for (NnUint batch = 0u; batch < batchCount; ++batch) {
+        for (NnUint shard = 0u; shard < microshardCount; ++shard) {
+            const NnUint start = shard * microshardSize;
+            const NnUint end = start + microshardSize;
+            double denominator = 0.0;
+            double moment = 0.0;
+            float maximum = -INFINITY;
+            NnUint argmax = start;
+            for (NnUint token = start; token < end; ++token) {
+                const float logit = logits[batch * vocabSize + token];
+                if (logit > maximum) {
+                    maximum = logit;
+                    argmax = token;
+                }
+                const double shifted = shiftedVocabLogit(
+                    logit, 1.0f / temperature, globalMax[batch]);
+                const double weight = std::exp(shifted);
+                denominator += weight;
+                moment += weight * shifted;
+            }
+            const float *record = stats + batch * statsSize + shard * NN_VOCAB_STATS_WIDTH;
+            assert(std::fabs(record[0] - static_cast<float>(denominator)) < 0.00001f);
+            assert(std::fabs(record[1] - static_cast<float>(moment)) < 0.00001f);
+            assert(record[2] == maximum);
+            assert(record[3] == static_cast<float>(vocabStart + argmax));
+            const NnUint target = static_cast<NnUint>(targetTokens[batch]) - vocabStart;
+            if (target >= start && target < end)
+                assert(record[4] == logits[batch * vocabSize + target]);
+            else
+                assert(std::isinf(record[4]) && record[4] < 0.0f);
+        }
+    }
+    printPassed("vocabLocalStatsVectorTail");
+}
+
 void testLearnedExpertScale() {
     float probabilities[] = {0.1f, 0.4f, 0.4f, 0.1f};
     float scales[] = {1.0f, 2.0f, 3.0f, 1.0f};
@@ -1105,6 +1194,7 @@ int main() {
     testScaledShardedEmbedding();
     testMultiPlaneCast();
     testVocabOps();
+    testVocabLocalStatsVectorTail();
     testLearnedExpertScale();
     return 0;
 }

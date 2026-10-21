@@ -2205,6 +2205,126 @@ static double shiftedVocabLogit(float logit, float inverseTemperature, float sca
     return static_cast<double>(scaledLogit) - scaledMaximum;
 }
 
+#if defined(__ARM_NEON)
+static inline void vocabLocalStatsAccumulate_NEON(
+    const float *input,
+    const NnUint end,
+    const float inverseTemperature,
+    const float globalMax,
+    double *denominator,
+    double *moment,
+    float *localMax,
+    NnUint *argmax,
+    NnUint *token) {
+    const float32x4_t inverseTemperatureVec = vdupq_n_f32(inverseTemperature);
+    const float32x4_t globalMaxVec = vdupq_n_f32(globalMax);
+    const float32x4_t infinityVec = vdupq_n_f32(INFINITY);
+    const float64x2_t globalMaxF64 = vdupq_n_f64(static_cast<double>(globalMax));
+    float64x2_t denominatorLow = vdupq_n_f64(0.0);
+    float64x2_t denominatorHigh = vdupq_n_f64(0.0);
+    float64x2_t momentLow = vdupq_n_f64(0.0);
+    float64x2_t momentHigh = vdupq_n_f64(0.0);
+
+    for (; *token + 4u <= end; *token += 4u) {
+        const float32x4_t logits = vld1q_f32(input + *token);
+        const uint32x4_t finite = vcltq_f32(vabsq_f32(logits), infinityVec);
+        if (vminvq_u32(finite) == 0u)
+            throw std::runtime_error("VOCAB_LOCAL_STATS logits must be finite");
+
+        const float chunkMax = vmaxvq_f32(logits);
+        if (chunkMax > *localMax) {
+            for (NnUint lane = 0u; lane < 4u; ++lane) {
+                if (input[*token + lane] == chunkMax) {
+                    *localMax = input[*token + lane];
+                    *argmax = *token + lane;
+                    break;
+                }
+            }
+        }
+
+        // Multiplication stays in F32 to match shiftedVocabLogit. Widen before
+        // subtracting the maximum and accumulating the two reported moments.
+        const float32x4_t scaled = vmulq_f32(logits, inverseTemperatureVec);
+        const float32x4_t shiftedF32 = vsubq_f32(scaled, globalMaxVec);
+        const float32x4_t weights = tiedEmbeddingExp_NEON(shiftedF32);
+        const float64x2_t weightLow = vcvt_f64_f32(vget_low_f32(weights));
+        const float64x2_t weightHigh = vcvt_f64_f32(vget_high_f32(weights));
+        const float64x2_t shiftedLow = vsubq_f64(
+            vcvt_f64_f32(vget_low_f32(scaled)), globalMaxF64);
+        const float64x2_t shiftedHigh = vsubq_f64(
+            vcvt_f64_f32(vget_high_f32(scaled)), globalMaxF64);
+        denominatorLow = vaddq_f64(denominatorLow, weightLow);
+        denominatorHigh = vaddq_f64(denominatorHigh, weightHigh);
+        momentLow = vfmaq_f64(momentLow, weightLow, shiftedLow);
+        momentHigh = vfmaq_f64(momentHigh, weightHigh, shiftedHigh);
+    }
+    *denominator += vaddvq_f64(vaddq_f64(denominatorLow, denominatorHigh));
+    *moment += vaddvq_f64(vaddq_f64(momentLow, momentHigh));
+}
+#elif defined(__AVX2__)
+static inline double horizontalSumF64_avx2(const __m256d value) {
+    const __m128d halves = _mm_add_pd(
+        _mm256_castpd256_pd128(value), _mm256_extractf128_pd(value, 1));
+    return _mm_cvtsd_f64(_mm_add_sd(halves, _mm_unpackhi_pd(halves, halves)));
+}
+
+static inline void vocabLocalStatsAccumulate_AVX2(
+    const float *input,
+    const NnUint end,
+    const float inverseTemperature,
+    const float globalMax,
+    double *denominator,
+    double *moment,
+    float *localMax,
+    NnUint *argmax,
+    NnUint *token) {
+    const __m256 inverseTemperatureVec = _mm256_set1_ps(inverseTemperature);
+    const __m256 globalMaxVec = _mm256_set1_ps(globalMax);
+    const __m256 infinityVec = _mm256_set1_ps(INFINITY);
+    const __m256 signMask = _mm256_set1_ps(-0.0f);
+    const __m256d globalMaxF64 = _mm256_set1_pd(static_cast<double>(globalMax));
+    __m256d denominatorLow = _mm256_setzero_pd();
+    __m256d denominatorHigh = _mm256_setzero_pd();
+    __m256d momentLow = _mm256_setzero_pd();
+    __m256d momentHigh = _mm256_setzero_pd();
+
+    for (; *token + 8u <= end; *token += 8u) {
+        const __m256 logits = _mm256_loadu_ps(input + *token);
+        const __m256 absolute = _mm256_andnot_ps(signMask, logits);
+        const __m256 finite = _mm256_cmp_ps(absolute, infinityVec, _CMP_LT_OQ);
+        if (_mm256_movemask_ps(finite) != 0xff)
+            throw std::runtime_error("VOCAB_LOCAL_STATS logits must be finite");
+
+        const float chunkMax = horizontalMax_avx2(logits);
+        if (chunkMax > *localMax) {
+            for (NnUint lane = 0u; lane < 8u; ++lane) {
+                if (input[*token + lane] == chunkMax) {
+                    *localMax = input[*token + lane];
+                    *argmax = *token + lane;
+                    break;
+                }
+            }
+        }
+
+        const __m256 scaled = _mm256_mul_ps(logits, inverseTemperatureVec);
+        const __m256 shiftedF32 = _mm256_sub_ps(scaled, globalMaxVec);
+        const __m256 weights = tiedEmbeddingExp_AVX2(shiftedF32);
+        const __m128 scaledLow = _mm256_castps256_ps128(scaled);
+        const __m128 scaledHigh = _mm256_extractf128_ps(scaled, 1);
+        const __m256d shiftedLow = _mm256_sub_pd(_mm256_cvtps_pd(scaledLow), globalMaxF64);
+        const __m256d shiftedHigh = _mm256_sub_pd(_mm256_cvtps_pd(scaledHigh), globalMaxF64);
+        const __m256d weightLow = _mm256_cvtps_pd(_mm256_castps256_ps128(weights));
+        const __m256d weightHigh = _mm256_cvtps_pd(_mm256_extractf128_ps(weights, 1));
+        denominatorLow = _mm256_add_pd(denominatorLow, weightLow);
+        denominatorHigh = _mm256_add_pd(denominatorHigh, weightHigh);
+        momentLow = _mm256_fmadd_pd(weightLow, shiftedLow, momentLow);
+        momentHigh = _mm256_fmadd_pd(weightHigh, shiftedHigh, momentHigh);
+    }
+    *denominator += horizontalSumF64_avx2(_mm256_add_pd(denominatorLow, denominatorHigh));
+    *moment += horizontalSumF64_avx2(_mm256_add_pd(momentLow, momentHigh));
+}
+#endif
+
 static void vocabLocalStatsForward(
     NnUint nThreads,
     NnUint threadIndex,
@@ -2228,7 +2348,15 @@ static void vocabLocalStatsForward(
             NnUint argmax = 0u;
             const NnUint start = localShard * microshardSize;
             const NnUint end = start + microshardSize;
-            for (NnUint token = start; token < end; ++token) {
+            NnUint token = start;
+#if defined(__ARM_NEON)
+            vocabLocalStatsAccumulate_NEON(input, end, inverseTemperature, globalMax,
+                &denominator, &moment, &localMax, &argmax, &token);
+#elif defined(__AVX2__)
+            vocabLocalStatsAccumulate_AVX2(input, end, inverseTemperature, globalMax,
+                &denominator, &moment, &localMax, &argmax, &token);
+#endif
+            for (; token < end; ++token) {
                 const float logit = input[token];
                 if (!std::isfinite(logit))
                     throw std::runtime_error("VOCAB_LOCAL_STATS logits must be finite");
