@@ -425,12 +425,29 @@ class tinyBLAS {
             int64_t ii = m0 + job / xtiles * RM;
             int64_t jj = n0 + job % xtiles * RN;
             D Cv[RN][RM] = {};
-            for (int64_t l = 0; l < k; l += KN)
-                for (int64_t j = 0; j < RN; ++j)
+            for (int64_t l = 0; l < k; l += KN) {
+                // Load the smaller tile side once and reuse it across all
+                // accumulators, as in current upstream llamafile tinyBLAS.
+                if (RM <= RN) {
+                    V Av[RM];
                     for (int64_t i = 0; i < RM; ++i)
-                        Cv[j][i] = madd(load<V>(A + lda * (ii + i) + l),
-                                        load<V>(B + ldb * (jj + j) + l),
-                                        Cv[j][i]);
+                        Av[i] = load<V>(A + lda * (ii + i) + l);
+                    for (int64_t j = 0; j < RN; ++j) {
+                        const V Bv = load<V>(B + ldb * (jj + j) + l);
+                        for (int64_t i = 0; i < RM; ++i)
+                            Cv[j][i] = madd(Av[i], Bv, Cv[j][i]);
+                    }
+                } else {
+                    V Bv[RN];
+                    for (int64_t j = 0; j < RN; ++j)
+                        Bv[j] = load<V>(B + ldb * (jj + j) + l);
+                    for (int64_t i = 0; i < RM; ++i) {
+                        const V Av = load<V>(A + lda * (ii + i) + l);
+                        for (int64_t j = 0; j < RN; ++j)
+                            Cv[j][i] = madd(Av, Bv[j], Cv[j][i]);
+                    }
+                }
+            }
             for (int64_t j = 0; j < RN; ++j)
                 for (int64_t i = 0; i < RM; ++i)
                     C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
@@ -471,11 +488,25 @@ class tinyBLAS_Q0_ARM {
   private:
     NOINLINE void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
         int64_t mc, nc, mp, np;
-        switch ((MIN(m - m0, 3) << 4) | MIN(n - n0, 3ll)) {
+        // Four B rows improve reuse for the short reductions used by model
+        // projections. Very long reductions put enough pressure on the NEON
+        // register file that the original 3-column tile remains faster.
+        const int64_t maxN = k <= 256 ? 4 : 3;
+        switch ((MIN(m - m0, 3) << 4) | MIN(n - n0, maxN)) {
+        case 0x34:
+            mc = 3;
+            nc = 4;
+            gemm<3, 4>(m0, m, n0, n);
+            break;
         case 0x33:
             mc = 3;
             nc = 3;
             gemm<3, 3>(m0, m, n0, n);
+            break;
+        case 0x24:
+            mc = 2;
+            nc = 4;
+            gemm<2, 4>(m0, m, n0, n);
             break;
         case 0x32:
             mc = 3;
@@ -502,6 +533,11 @@ class tinyBLAS_Q0_ARM {
             nc = 3;
             gemm<1, 3>(m0, m, n0, n);
             break;
+        case 0x14:
+            mc = 1;
+            nc = 4;
+            gemm<1, 4>(m0, m, n0, n);
+            break;
         case 0x21:
             mc = 2;
             nc = 1;
@@ -527,7 +563,58 @@ class tinyBLAS_Q0_ARM {
     }
 
     template <int RM, int RN>
-    NOINLINE void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+    void gemm(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+        if (k <= 256)
+            gemm_reuse<RM, RN>(m0, m, n0, n);
+        else
+            gemm_original<RM, RN>(m0, m, n0, n);
+    }
+
+    template <int RM, int RN>
+    NOINLINE void gemm_reuse(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+        int64_t ytiles = (m - m0) / RM;
+        int64_t xtiles = (n - n0) / RN;
+        int64_t tiles = xtiles * ytiles;
+        int64_t duty = (tiles + nth - 1) / nth;
+        int64_t start = duty * ith;
+        int64_t end = start + duty;
+        if (end > tiles)
+            end = tiles;
+        for (int64_t job = start; job < end; ++job) {
+            int64_t ii = m0 + job / xtiles * RM;
+            int64_t jj = n0 + job % xtiles * RN;
+            float32x4_t Cv[RN][RM] = {};
+            for (int64_t l = 0; l < k; ++l) {
+                int8x16_t Alo[RM];
+                int8x16_t Ahi[RM];
+                float Ad[RM];
+                for (int64_t i = 0; i < RM; ++i) {
+                    const TA *block = A + lda * (ii + i) + l;
+                    load_block(block, Alo[i], Ahi[i]);
+                    Ad[i] = unhalf(block->d);
+                }
+                for (int64_t j = 0; j < RN; ++j) {
+                    const TB *block = B + ldb * (jj + j) + l;
+                    int8x16_t Blo;
+                    int8x16_t Bhi;
+                    load_block(block, Blo, Bhi);
+                    const float Bd = unhalf(block->d);
+                    for (int64_t i = 0; i < RM; ++i) {
+                        const int32x4_t dot = vdotq_s32(
+                            vdotq_s32(vdupq_n_s32(0), Alo[i], Blo), Ahi[i], Bhi);
+                        Cv[j][i] = vmlaq_n_f32(
+                            Cv[j][i], vcvtq_f32_s32(dot), Ad[i] * Bd);
+                    }
+                }
+            }
+            for (int64_t j = 0; j < RN; ++j)
+                for (int64_t i = 0; i < RM; ++i)
+                    C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
+        }
+    }
+
+    template <int RM, int RN>
+    NOINLINE void gemm_original(int64_t m0, int64_t m, int64_t n0, int64_t n) {
         int64_t ytiles = (m - m0) / RM;
         int64_t xtiles = (n - n0) / RN;
         int64_t tiles = xtiles * ytiles;
@@ -544,37 +631,49 @@ class tinyBLAS_Q0_ARM {
                 for (int64_t j = 0; j < RN; ++j)
                     for (int64_t i = 0; i < RM; ++i)
                         Cv[j][i] = vmlaq_n_f32(Cv[j][i],
-                                               vcvtq_f32_s32(vdotq_s32(
-                                                   vdotq_s32(vdupq_n_s32(0),
-                                                             load_lo(A + lda * (ii + i) + l),
-                                                             load_lo(B + ldb * (jj + j) + l)),
-                                                   load_hi(A + lda * (ii + i) + l),
-                                                   load_hi(B + ldb * (jj + j) + l))),
-                                               unhalf(A[lda * (ii + i) + l].d) *
-                                               unhalf(B[ldb * (jj + j) + l].d));
+                            vcvtq_f32_s32(vdotq_s32(
+                                vdotq_s32(vdupq_n_s32(0),
+                                    load_lo(A + lda * (ii + i) + l),
+                                    load_lo(B + ldb * (jj + j) + l)),
+                                load_hi(A + lda * (ii + i) + l),
+                                load_hi(B + ldb * (jj + j) + l))),
+                            unhalf(A[lda * (ii + i) + l].d) *
+                            unhalf(B[ldb * (jj + j) + l].d));
             for (int64_t j = 0; j < RN; ++j)
                 for (int64_t i = 0; i < RM; ++i)
                     C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
         }
     }
 
-    inline int8x16_t load_lo(const NnBlockQ80 *b) {
+    static inline void load_block(const NnBlockQ80 *b, int8x16_t &lo, int8x16_t &hi) {
+        lo = vld1q_s8(b->qs);
+        hi = vld1q_s8(b->qs + 16);
+    }
+
+    static inline void load_block(const NnBlockQ40 *b, int8x16_t &lo, int8x16_t &hi) {
+        const uint8x16_t packed = vld1q_u8(b->qs);
+        const uint8x16_t mask = vdupq_n_u8(0x0f);
+        const int8x16_t offset = vdupq_n_s8(0x8);
+        lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(packed, mask)), offset);
+        hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(packed, 4)), offset);
+    }
+
+    static inline int8x16_t load_lo(const NnBlockQ80 *b) {
         return vld1q_s8(b->qs);
     }
 
-    inline int8x16_t load_hi(const NnBlockQ80 *b) {
+    static inline int8x16_t load_hi(const NnBlockQ80 *b) {
         return vld1q_s8(b->qs + 16);
     }
 
-    inline int8x16_t load_lo(const NnBlockQ40 *b) {
-        return vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vld1q_u8(b->qs),
-                                                     vdupq_n_u8(0x0f))),
-                        vdupq_n_s8(0x8));
+    static inline int8x16_t load_lo(const NnBlockQ40 *b) {
+        return vsubq_s8(vreinterpretq_s8_u8(vandq_u8(
+            vld1q_u8(b->qs), vdupq_n_u8(0x0f))), vdupq_n_s8(0x8));
     }
 
-    inline int8x16_t load_hi(const NnBlockQ40 *b) {
-        return vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(vld1q_u8(b->qs), 4)),
-                        vdupq_n_s8(0x8));
+    static inline int8x16_t load_hi(const NnBlockQ40 *b) {
+        return vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(
+            vld1q_u8(b->qs), 4)), vdupq_n_s8(0x8));
     }
 
     const TA *const A;
