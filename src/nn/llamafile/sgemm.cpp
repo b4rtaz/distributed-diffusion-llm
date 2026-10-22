@@ -488,11 +488,20 @@ class tinyBLAS_Q0_ARM {
   private:
     NOINLINE void mnpack(int64_t m0, int64_t m, int64_t n0, int64_t n) {
         int64_t mc, nc, mp, np;
-        // Four B rows improve reuse for the short reductions used by model
-        // projections. Very long reductions put enough pressure on the NEON
-        // register file that the original 3-column tile remains faster.
-        const int64_t maxN = k <= 256 ? 4 : 3;
+        // Short reductions favor four B rows. K-blocking keeps the long path's
+        // working set small enough for a wider, spill-free six-row tile.
+        const int64_t maxN = k <= 256 ? 4 : 6;
         switch ((MIN(m - m0, 3) << 4) | MIN(n - n0, maxN)) {
+        case 0x36:
+            mc = 3;
+            nc = 6;
+            gemm<3, 6>(m0, m, n0, n);
+            break;
+        case 0x35:
+            mc = 3;
+            nc = 5;
+            gemm<3, 5>(m0, m, n0, n);
+            break;
         case 0x34:
             mc = 3;
             nc = 4;
@@ -507,6 +516,16 @@ class tinyBLAS_Q0_ARM {
             mc = 2;
             nc = 4;
             gemm<2, 4>(m0, m, n0, n);
+            break;
+        case 0x25:
+            mc = 2;
+            nc = 5;
+            gemm<2, 5>(m0, m, n0, n);
+            break;
+        case 0x26:
+            mc = 2;
+            nc = 6;
+            gemm<2, 6>(m0, m, n0, n);
             break;
         case 0x32:
             mc = 3;
@@ -538,6 +557,16 @@ class tinyBLAS_Q0_ARM {
             nc = 4;
             gemm<1, 4>(m0, m, n0, n);
             break;
+        case 0x15:
+            mc = 1;
+            nc = 5;
+            gemm<1, 5>(m0, m, n0, n);
+            break;
+        case 0x16:
+            mc = 1;
+            nc = 6;
+            gemm<1, 6>(m0, m, n0, n);
+            break;
         case 0x21:
             mc = 2;
             nc = 1;
@@ -567,7 +596,7 @@ class tinyBLAS_Q0_ARM {
         if (k <= 256)
             gemm_reuse<RM, RN>(m0, m, n0, n);
         else
-            gemm_original<RM, RN>(m0, m, n0, n);
+            gemm_blocked<RM, RN>(m0, m, n0, n);
     }
 
     template <int RM, int RN>
@@ -614,7 +643,7 @@ class tinyBLAS_Q0_ARM {
     }
 
     template <int RM, int RN>
-    NOINLINE void gemm_original(int64_t m0, int64_t m, int64_t n0, int64_t n) {
+    NOINLINE void gemm_blocked(int64_t m0, int64_t m, int64_t n0, int64_t n) {
         int64_t ytiles = (m - m0) / RM;
         int64_t xtiles = (n - n0) / RN;
         int64_t tiles = xtiles * ytiles;
@@ -623,25 +652,47 @@ class tinyBLAS_Q0_ARM {
         int64_t end = start + duty;
         if (end > tiles)
             end = tiles;
-        for (int64_t job = start; job < end; ++job) {
-            int64_t ii = m0 + job / xtiles * RM;
-            int64_t jj = n0 + job % xtiles * RN;
-            float32x4_t Cv[RN][RM] = {};
-            for (int64_t l = 0; l < k; ++l)
-                for (int64_t j = 0; j < RN; ++j)
-                    for (int64_t i = 0; i < RM; ++i)
-                        Cv[j][i] = vmlaq_n_f32(Cv[j][i],
-                            vcvtq_f32_s32(vdotq_s32(
-                                vdotq_s32(vdupq_n_s32(0),
-                                    load_lo(A + lda * (ii + i) + l),
-                                    load_lo(B + ldb * (jj + j) + l)),
-                                load_hi(A + lda * (ii + i) + l),
-                                load_hi(B + ldb * (jj + j) + l))),
-                            unhalf(A[lda * (ii + i) + l].d) *
-                            unhalf(B[ldb * (jj + j) + l].d));
-            for (int64_t j = 0; j < RN; ++j)
-                for (int64_t i = 0; i < RM; ++i)
-                    C[ldc * (jj + j) + (ii + i)] = hsum(Cv[j][i]);
+        // A complete embedding row is much larger than cache. Process a small
+        // slice of the reduction at a time so its Q4 weights remain hot while
+        // the tile walks across all batch columns.
+        constexpr int64_t KC = 256;
+        for (int64_t l0 = 0; l0 < k; l0 += KC) {
+            const int64_t l1 = MIN(l0 + KC, k);
+            for (int64_t job = start; job < end; ++job) {
+                const int64_t ii = m0 + job / xtiles * RM;
+                const int64_t jj = n0 + job % xtiles * RN;
+                float32x4_t Cv[RN][RM] = {};
+                for (int64_t l = l0; l < l1; ++l) {
+                    int8x16_t Alo[RM];
+                    int8x16_t Ahi[RM];
+                    float Ad[RM];
+                    for (int64_t i = 0; i < RM; ++i) {
+                        const TA *block = A + lda * (ii + i) + l;
+                        load_block(block, Alo[i], Ahi[i]);
+                        Ad[i] = unhalf(block->d);
+                    }
+                    for (int64_t j = 0; j < RN; ++j) {
+                        const TB *block = B + ldb * (jj + j) + l;
+                        int8x16_t Blo;
+                        int8x16_t Bhi;
+                        load_block(block, Blo, Bhi);
+                        const float Bd = unhalf(block->d);
+                        for (int64_t i = 0; i < RM; ++i) {
+                            const int32x4_t dot = vdotq_s32(
+                                vdotq_s32(vdupq_n_s32(0), Alo[i], Blo), Ahi[i], Bhi);
+                            Cv[j][i] = vmlaq_n_f32(
+                                Cv[j][i], vcvtq_f32_s32(dot), Ad[i] * Bd);
+                        }
+                    }
+                }
+                for (int64_t j = 0; j < RN; ++j) {
+                    for (int64_t i = 0; i < RM; ++i) {
+                        float *result = C + ldc * (jj + j) + (ii + i);
+                        const float partial = hsum(Cv[j][i]);
+                        *result = l0 == 0 ? partial : *result + partial;
+                    }
+                }
+            }
         }
     }
 
