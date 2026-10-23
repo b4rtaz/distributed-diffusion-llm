@@ -63,6 +63,7 @@ struct NodeBuilder {
     NnUint branchCombined;
     NnUint ropeSliding;
     NnUint ropeFull;
+    NnUint localLogits;
     NnUint globalVocabularyMax;
     NnUint partialEmbeddingMix;
     NnUint embeddingProbabilities;
@@ -178,6 +179,7 @@ struct NodeBuilder {
         branchCombined = node.addBuffer("branch_combined", size2D(F_32, batches, h.hiddenSize));
         ropeSliding = node.addBuffer("rope_sliding", size2D(F_32, context, h.slidingHeadDim));
         ropeFull = node.addBuffer("rope_full", size2D(F_32, context, h.fullHeadDim));
+        localLogits = node.addBuffer("local_logits", size2D(F_32, batches, localVocab()));
         const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
         globalVocabularyMax = node.addBuffer("global_vocabulary_max", size2D(F_32, batches, 1u));
         partialEmbeddingMix = node.addBuffer("partial_embedding_mix",
@@ -594,17 +596,17 @@ struct NodeBuilder {
         NnSegmentConfigBuilder s;
         castForMatmul(s, x, quantHidden, decoder ? "decoder.quantize_logits" : "encoder.quantize_logits");
         s.addOp(OP_MATMUL, "token_embedding.weight", 0u,
-            pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
+            pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_BUFFER, localLogits),
             size2D(weightType, h.hiddenSize, localVocab()), embeddingWeight,
             NnMatmulOpConfig{0u, 0u, expertIndexes});
         if (!decoder) {
             s.addOp(OP_SCALE, "logits.pre_softcap", 0u,
-                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(),
+                pointerBatchConfig(SRC_BUFFER, localLogits), pointerBatchConfig(SRC_BUFFER, localLogits), size0(),
                 NnScaleOpCodeConfig{0u, 1.0f / h.logitSoftcap, 1u});
             s.addOp(OP_TANH, "logits.tanh", 0u,
-                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(), NnTanhOpCodeConfig{});
+                pointerBatchConfig(SRC_BUFFER, localLogits), pointerBatchConfig(SRC_BUFFER, localLogits), size0(), NnTanhOpCodeConfig{});
             s.addOp(OP_SCALE, "logits.post_softcap", 0u,
-                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits), size0(),
+                pointerBatchConfig(SRC_BUFFER, localLogits), pointerBatchConfig(SRC_BUFFER, localLogits), size0(),
                 NnScaleOpCodeConfig{0u, h.logitSoftcap, 1u});
         }
         node.addSegment(s.build());
@@ -615,7 +617,7 @@ struct NodeBuilder {
         if (decoder) {
             const NnUint mixWidth = ((h.hiddenSize + 2u + 31u) / 32u) * 32u;
             maxima.addOp(OP_TIED_EMBEDDING_PARTIAL, "embedding_mix.probabilities", 0u,
-                pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchConfig(SRC_PIPE, pipes.localLogits),
+                pointerBatchConfig(SRC_BUFFER, localLogits), pointerBatchConfig(SRC_BUFFER, localLogits),
                 size0(),
                 NnTiedEmbeddingPartialOpConfig{pipes.temperature, partialEmbeddingMix,
                     embeddingProbabilities, mixWidth, localVocab(), 1u,
@@ -641,7 +643,7 @@ struct NodeBuilder {
             return;
         }
         maxima.addOp(OP_REDUCE_MAX, "embedding_mix.local_max", 0u,
-            pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync),
+            pointerBatchConfig(SRC_BUFFER, localLogits), pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync),
             size0(), NnReduceMaxOpConfig{pipes.temperature, 1u});
         maxima.addSync(pipes.vocabularyMaxSync, SYNC_NODE_SLICES);
         node.addSegment(maxima.build());
@@ -663,7 +665,7 @@ struct NodeBuilder {
                 size0(), NnCastOpCodeConfig{});
         }
         sum.addOp(OP_VOCAB_LOCAL_STATS, "sampler.local_stats", 0u,
-            pointerBatchConfig(SRC_PIPE, pipes.localLogits), pointerBatchedSliceConfig(SRC_PIPE, pipes.samplerStatsSync),
+            pointerBatchConfig(SRC_BUFFER, localLogits), pointerBatchedSliceConfig(SRC_PIPE, pipes.samplerStatsSync),
             size0(), NnVocabLocalStatsOpConfig{globalVocabularyMax, pipes.temperature,
                 pipes.targetTokens, nodeIndex * localVocab(), NN_VOCAB_MICROSHARDS / nNodes,
                 decoder ? 0u : 1u});
@@ -685,7 +687,7 @@ struct NodeBuilder {
         finalize.addOp(OP_VOCAB_SAMPLE, "sampler.sample", 0u,
             pointerBatchConfig(SRC_PIPE, pipes.samplerStatsSync), pointerBatchedSliceConfig(SRC_PIPE, pipes.sampledTokensSync),
             size0(), NnVocabSampleOpConfig{globalVocabularyMax, pipes.temperature,
-                pipes.samplingCoins, pipes.localLogits, nodeIndex * localVocab(),
+                pipes.samplingCoins, localLogits, nodeIndex * localVocab(),
                 nodeIndex * (NN_VOCAB_MICROSHARDS / nNodes), NN_VOCAB_MICROSHARDS / nNodes});
         finalize.addSync(pipes.sampledTokensSync, SYNC_NODE_SLICES_EXCEPT_ROOT);
         node.addSegment(finalize.build());
@@ -748,7 +750,6 @@ DiffusionGemmaGraph buildDiffusionGemmaGraph(
     graph.pipes.inputSync = net.addPipe("input_sync", size2D(transferType, maxBatchSize, nNodes * header.hiddenSize));
     graph.pipes.attentionSync = net.addPipe("attention_sync", size2D(transferType, maxBatchSize, nNodes * header.hiddenSize));
     graph.pipes.feedForwardSync = net.addPipe("feed_forward_sync", size2D(transferType, maxBatchSize, nNodes * 2u * header.hiddenSize));
-    graph.pipes.localLogits = net.addPipe("local_logits", size2D(F_32, maxBatchSize, header.vocabSize / nNodes));
     graph.pipes.vocabularyMaxSync = net.addPipe("vocabulary_max_sync", size2D(F_32, maxBatchSize, nNodes));
     const NnUint mixWidth = ((header.hiddenSize + 2u + 31u) / 32u) * 32u;
     graph.pipes.embeddingMixSync = net.addPipe("embedding_mix_sync", size2D(transferType, maxBatchSize, nNodes * mixWidth));

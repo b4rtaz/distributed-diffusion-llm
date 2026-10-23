@@ -20,7 +20,7 @@ layout(binding = 3) readonly uniform configBuffer {
     uint globalMaxBufferIndex;
     uint temperaturePipeIndex;
     uint samplingCoinsPipeIndex;
-    uint localLogitsPipeIndex;
+    uint localLogitsBufferIndex;
     uint vocabStart;
     uint microshardStart;
     uint microshardCount;

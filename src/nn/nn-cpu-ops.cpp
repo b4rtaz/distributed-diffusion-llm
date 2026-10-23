@@ -2192,8 +2192,13 @@ static void initVocabSampleForward(NnCpuOpContext *context) {
     ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.x, 1u);
     ASSERT_EQ(context->pipeConfigs[config->temperaturePipeIndex].size.y, 1u);
     ASSERT_EQ(context->pipeConfigs[config->samplingCoinsPipeIndex].size.x, 1u);
+    const NnBufferConfig *logits =
+        &context->bufferConfigs[config->localLogitsBufferIndex];
+    ASSERT_EQ(logits->size.floatType, F_32);
+    ASSERT_EQ(logits->size.y, context->nBatches);
     if (config->microshardCount == 0u ||
-        config->microshardStart + config->microshardCount > context->inputSize.x / NN_VOCAB_STATS_WIDTH)
+        config->microshardStart + config->microshardCount > context->inputSize.x / NN_VOCAB_STATS_WIDTH ||
+        logits->size.x % config->microshardCount != 0u)
         throw std::invalid_argument("VOCAB_SAMPLE microshard range is out of bounds");
 }
 
@@ -2428,8 +2433,8 @@ static void vocabSampleForward(
         if (owner < config->microshardStart ||
             owner >= config->microshardStart + config->microshardCount)
             continue;
-        const NnSize3D &logitsSize = context->pipeConfigs[config->localLogitsPipeIndex].size;
-        const float *logits = (const float *)context->pipes[config->localLogitsPipeIndex] +
+        const NnSize3D &logitsSize = context->bufferConfigs[config->localLogitsBufferIndex].size;
+        const float *logits = (const float *)context->buffers[config->localLogitsBufferIndex] +
             (NnSize)batchIndex * logitsSize.x;
         const float globalMax = ((const float *)context->buffers[config->globalMaxBufferIndex])[batchIndex];
         const double localTarget = target - preceding;

@@ -236,9 +236,8 @@ DistributedResult runModel(
         result.localVocab = model.header().vocabSize / nNodes;
         result.layerCount = model.header().layerCount;
         result.firstPassHidden = copyBuffer(cpu, graph.nodes[0], "hidden");
-        const float *logits = reinterpret_cast<const float *>(execution.pipes[graph.pipes.localLogits]);
-        result.firstPassLogits.assign(logits,
-            logits + static_cast<std::size_t>(queryLength) * result.localVocab);
+        result.firstPassLogits = copyBuffer(cpu, graph.nodes[0], "local_logits");
+        result.firstPassLogits.resize(static_cast<std::size_t>(queryLength) * result.localVocab);
         result.conditionedSamples = runtime.denoise(
             targets, queryLength, queryLength, 0.8f, coins, 0u, 1u, true);
         result.q80Sync = model.header().weightType == DIFFUSION_GEMMA_Q40;

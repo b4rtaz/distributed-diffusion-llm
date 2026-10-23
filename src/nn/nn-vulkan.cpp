@@ -749,7 +749,7 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->globalMaxBufferIndex)});
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->temperaturePipeIndex)});
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->samplingCoinsPipeIndex)});
-            a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->localLogitsPipeIndex)});
+            a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->localLogitsBufferIndex)});
         } break;
         case OP_MOE_GATE: {
             const NnMoeGateOpCodeConfig *config = (NnMoeGateOpCodeConfig *)opConfig->config;
@@ -1319,6 +1319,22 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
             commandBuffer.dispatch(groupCountX, groupCountY, groupCountZ);
             VULKAN_TRACE("Dispatched %s (%d, %d, %d)", opCodeToString(opConfig->code), groupCountX, groupCountY, groupCountZ);
         }
+
+        // Buffers are shared by all segments, while each segment owns a
+        // separate command buffer. Publish this segment's shader writes to
+        // compute commands submitted by following segments.
+        vk::MemoryBarrier segmentMemoryBarrier(
+            vk::AccessFlagBits::eShaderWrite,
+            vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
+        );
+        commandBuffer.pipelineBarrier(
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::PipelineStageFlagBits::eComputeShader,
+            vk::DependencyFlags(),
+            { segmentMemoryBarrier },
+            nullptr,
+            nullptr
+        );
         commandBuffer.end();
     }
 

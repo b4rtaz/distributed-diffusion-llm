@@ -53,10 +53,13 @@ void run(const DiffusionGemmaModelFile &model, NnUint threads, NnUint batches,
         devices.emplace_back(new NnCpuDevice(&graph.net, &graph.nodes[0], &execution), -1, -1);
     NnFakeNodeSynchronizer synchronizer;
     NnExecutor executor(&graph.net, &graph.nodes[0], &devices, &execution, &synchronizer, true);
-    NnUint quantIndex = UINT32_MAX, mixIndex = UINT32_MAX, headSegment = UINT32_MAX;
+    NnUint quantIndex = UINT32_MAX, logitsIndex = UINT32_MAX;
+    NnUint mixIndex = UINT32_MAX, headSegment = UINT32_MAX;
     for (NnUint i = 0u; i < graph.nodes[0].nBuffers; ++i) {
         if (std::strcmp(graph.nodes[0].buffers[i].name, "quant_hidden") == 0)
             quantIndex = i;
+        if (std::strcmp(graph.nodes[0].buffers[i].name, "local_logits") == 0)
+            logitsIndex = i;
         if (std::strcmp(graph.nodes[0].buffers[i].name, "local_embedding_mix") == 0)
             mixIndex = i;
     }
@@ -66,7 +69,8 @@ void run(const DiffusionGemmaModelFile &model, NnUint threads, NnUint batches,
             if (segment.ops[op].code == OP_TIED_EMBEDDING_PARTIAL)
                 headSegment = s;
     }
-    if (quantIndex == UINT32_MAX || mixIndex == UINT32_MAX || headSegment == UINT32_MAX)
+    if (quantIndex == UINT32_MAX || logitsIndex == UINT32_MAX ||
+        mixIndex == UINT32_MAX || headSegment == UINT32_MAX)
         throw std::runtime_error("missing tied-embedding graph buffers or segment");
     NnRootWeightLoader loader(&executor, NULL, 1u);
     loadDiffusionGemmaWeights(model, graph, &loader);
@@ -103,10 +107,11 @@ void run(const DiffusionGemmaModelFile &model, NnUint threads, NnUint batches,
             std::printf("run %u pass %u: %s %.3f ms\n", repeat + 1u, pass + 1u,
                 replayHead ? "head + sampling" : "decoder",
                 executor.getTotalTime(STEP_EXECUTE_OP) / 1000.0);
-            const float *logits = reinterpret_cast<const float *>(execution.pipes[graph.pipes.localLogits]);
             const float *mix = reinterpret_cast<const float *>(execution.pipes[graph.pipes.selfConditioning]);
             const std::size_t logitCount = static_cast<std::size_t>(batches) * h.vocabSize;
             const std::size_t mixCount = static_cast<std::size_t>(batches) * h.hiddenSize;
+            std::vector<float> logits(logitCount);
+            devices[0].device->readBuffer(logitsIndex, reinterpret_cast<NnByte *>(logits.data()));
             const NnUint mixWidth = graph.nodes[0].buffers[mixIndex].size.x;
             std::vector<float> localMix(graph.nodes[0].buffers[mixIndex].size.nBytes / sizeof(float));
             devices[0].device->readBuffer(mixIndex, reinterpret_cast<NnByte *>(localMix.data()));
@@ -124,7 +129,7 @@ void run(const DiffusionGemmaModelFile &model, NnUint threads, NnUint batches,
                 if (!std::isfinite(sample.entropy))
                     throw std::runtime_error("non-finite entropy");
             if (!vulkan && repeat == 0u) {
-                reference[pass].logits.assign(logits, logits + logitCount);
+                reference[pass].logits = logits;
                 reference[pass].mix.assign(mix, mix + mixCount);
                 reference[pass].samples = samples;
                 reference[pass].normalizedMix = normalizedMix;
@@ -141,7 +146,7 @@ void run(const DiffusionGemmaModelFile &model, NnUint threads, NnUint batches,
                         gpuHidden.data(), mixCount, 1u, 0u);
                     compare("head input (diagnostic)", gpuHidden.data(), cpuHidden, INFINITY, INFINITY);
                 }
-                compare("logits", logits, reference[pass].logits,
+                compare("logits", logits.data(), reference[pass].logits,
                     replayHead ? 0.001 : vulkan ? 60.0 : 0.0,
                     replayHead ? 0.0001 : vulkan ? 10.0 : 0.0);
                 compare("pre-Q80 normalized mix", normalizedMix.data(), reference[pass].normalizedMix,

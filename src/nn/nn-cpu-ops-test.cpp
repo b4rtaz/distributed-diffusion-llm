@@ -967,16 +967,17 @@ void testVocabOps() {
         (NnByte *)&temperature,
         (NnByte *)targetTokens,
         (NnByte *)samplingCoins,
-        (NnByte *)logits,
     };
     NnPipeConfig pipeConfigs[] = {
         {NULL, size1D(F_32, 1u)},
         {NULL, size2D(F_32, batchCount, 1u)},
         {NULL, size2D(F_32, batchCount, 1u)},
+    };
+    NnByte *buffers[] = {(NnByte *)globalMax, (NnByte *)logits};
+    NnBufferConfig bufferConfigs[] = {
+        {NULL, size2D(F_32, batchCount, 1u)},
         {NULL, size2D(F_32, batchCount, vocabSize)},
     };
-    NnByte *buffers[] = {(NnByte *)globalMax};
-    NnBufferConfig bufferConfigs[] = {{NULL, size2D(F_32, batchCount, 1u)}};
     NnByte *logitRows[batchCount];
     NnByte *statsRows[batchCount];
     NnByte *sampleRows[batchCount];
@@ -1003,7 +1004,7 @@ void testVocabOps() {
     for (NnUint thread = 3u; thread-- > 0u;)
         vocabLocalStatsForward(3u, thread, batchCount, &localContext);
 
-    NnVocabSampleOpConfig sampleConfig = {0u, 0u, 2u, 3u, vocabStart, 0u, microshardCount};
+    NnVocabSampleOpConfig sampleConfig = {0u, 0u, 2u, 1u, vocabStart, 0u, microshardCount};
     NnCpuOpContext sampleContext = localContext;
     sampleContext.opConfig = &sampleConfig;
     sampleContext.input = statsRows;

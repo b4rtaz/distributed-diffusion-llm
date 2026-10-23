@@ -120,7 +120,8 @@ static void testLoadedModel(const char *path) {
     NnNetExecution execution(1u, &graph.net);
     execution.setBatchSize(model.header().canvasLength);
     std::vector<NnExecutorDevice> devices;
-    devices.push_back(NnExecutorDevice(new NnCpuDevice(&graph.net, &graph.nodes[0], &execution), -1, -1));
+    NnCpuDevice *cpu = new NnCpuDevice(&graph.net, &graph.nodes[0], &execution);
+    devices.push_back(NnExecutorDevice(cpu, -1, -1));
     NnFakeNodeSynchronizer synchronizer;
     {
         NnExecutor executor(&graph.net, &graph.nodes[0], &devices, &execution, &synchronizer, false);
@@ -138,8 +139,14 @@ static void testLoadedModel(const char *path) {
         const std::vector<DiffusionGemmaSampledPosition> resolved = runtime.denoise(
             tokens, model.header().canvasLength, model.header().canvasLength, 1.0f,
             std::vector<double>(model.header().canvasLength, 0.5), 0u, 1u, false);
-        const float *logits = reinterpret_cast<const float *>(execution.pipes[graph.pipes.localLogits]);
-        for (NnUint i = 0u; i < model.header().canvasLength * model.header().vocabSize; ++i)
+        NnUint logitsIndex = UINT32_MAX;
+        for (NnUint i = 0u; i < graph.nodes[0].nBuffers; ++i)
+            if (std::string(graph.nodes[0].buffers[i].name) == "local_logits")
+                logitsIndex = i;
+        assert(logitsIndex != UINT32_MAX);
+        std::vector<float> logits(model.header().canvasLength * model.header().vocabSize);
+        cpu->readBuffer(logitsIndex, reinterpret_cast<NnByte *>(logits.data()));
+        for (NnUint i = 0u; i < logits.size(); ++i)
             assert(logits[i] == 0.0f);
         for (NnUint i = 0u; i < model.header().canvasLength; ++i) {
             assert(resolved[i].token == static_cast<std::int32_t>(model.header().vocabSize / 2u));

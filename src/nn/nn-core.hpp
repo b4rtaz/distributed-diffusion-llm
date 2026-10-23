@@ -406,7 +406,7 @@ typedef struct {
     NnUint globalMaxBufferIndex;
     NnUint temperaturePipeIndex;
     NnUint samplingCoinsPipeIndex;
-    NnUint localLogitsPipeIndex;
+    NnUint localLogitsBufferIndex;
     NnUint vocabStart;
     NnUint microshardStart;
     NnUint microshardCount;

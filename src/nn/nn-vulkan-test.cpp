@@ -895,8 +895,6 @@ void testTiedEmbedding_F32() {
 void testVocabOps_F32_F32() {
     execute(
         [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *nodeBuilder, NnSegmentConfigBuilder *segmentBuilder) {
-            const NnUint logitsPipeIndex = netBuilder->addPipe("logits",
-                size2D(F_32, N_BATCHES, VOCAB_STATS_TEST_VOCAB));
             const NnUint temperaturePipeIndex = netBuilder->addPipe("temperature", size1D(F_32, 1u));
             const NnUint samplingCoinsPipeIndex = netBuilder->addPipe("sampling_coins",
                 size2D(F_32, N_BATCHES, 1u));
@@ -907,12 +905,14 @@ void testVocabOps_F32_F32() {
             netBuilder->addPreSync(temperaturePipeIndex);
             netBuilder->addPreSync(samplingCoinsPipeIndex);
             netBuilder->addPreSync(targetTokensPipeIndex);
+            const NnUint logitsBufferIndex = nodeBuilder->addBuffer("logits",
+                size2D(F_32, N_BATCHES, VOCAB_STATS_TEST_VOCAB));
             const NnUint globalMaxBufferIndex = nodeBuilder->addBuffer("global_max",
                 size2D(F_32, N_BATCHES, 1u));
             const NnUint statsBufferIndex = nodeBuilder->addBuffer("stats",
                 size2D(F_32, N_BATCHES, VOCAB_STATS_TEST_SHARDS * NN_VOCAB_STATS_WIDTH));
             segmentBuilder->addOp(OP_VOCAB_LOCAL_STATS, "vocab_local_stats", 0u,
-                pointerBatchConfig(SRC_PIPE, logitsPipeIndex),
+                pointerBatchConfig(SRC_BUFFER, logitsBufferIndex),
                 pointerBatchConfig(SRC_BUFFER, statsBufferIndex), size0(),
                 NnVocabLocalStatsOpConfig{globalMaxBufferIndex,
                     temperaturePipeIndex, targetTokensPipeIndex, 10u,
@@ -921,24 +921,24 @@ void testVocabOps_F32_F32() {
                 pointerBatchConfig(SRC_BUFFER, statsBufferIndex),
                 pointerBatchConfig(SRC_PIPE, sampledTokensPipeIndex), size0(),
                 NnVocabSampleOpConfig{globalMaxBufferIndex,
-                    temperaturePipeIndex, samplingCoinsPipeIndex, logitsPipeIndex,
+                    temperaturePipeIndex, samplingCoinsPipeIndex, logitsBufferIndex,
                     10u, 0u, VOCAB_STATS_TEST_SHARDS});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             const NnUint batchSize = 2u;
             execution->setBatchSize(batchSize);
-            float *logits = (float *)execution->pipes[0];
             const float values[] = {
                 0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f, 1.2f, 1.4f,
                 1.5f, 0.5f, -0.5f, -1.5f, -1.0f, 0.0f, 1.0f, 2.0f,
             };
-            std::copy(values, values + 16u, logits);
+            device->data.buffers[0].get()->write((const NnByte *)values);
+            const float *logits = values;
             const float temperature = 0.75f;
-            ((float *)execution->pipes[1])[0] = temperature;
-            float *coins = (float *)execution->pipes[2];
+            ((float *)execution->pipes[0])[0] = temperature;
+            float *coins = (float *)execution->pipes[1];
             coins[0] = 0.0f;
             coins[1] = 0.999f;
-            float *targets = (float *)execution->pipes[3];
+            float *targets = (float *)execution->pipes[2];
             targets[0] = 12.0f;
             targets[1] = 15.0f;
 
@@ -949,7 +949,7 @@ void testVocabOps_F32_F32() {
                     maxima[batch] = std::max(maxima[batch],
                         logits[batch * VOCAB_STATS_TEST_VOCAB + token] / temperature);
             }
-            device->data.buffers[0].get()->write((const NnByte *)maxima);
+            device->data.buffers[1].get()->write((const NnByte *)maxima);
 
             float expectedSamples[batchSize];
             for (NnUint batch = 0u; batch < batchSize; ++batch) {
@@ -974,12 +974,12 @@ void testVocabOps_F32_F32() {
             }
 
             executor->forward();
-            const float *actualSamples = (const float *)execution->pipes[4];
+            const float *actualSamples = (const float *)execution->pipes[3];
             for (NnUint batch = 0u; batch < batchSize; ++batch)
                 assertFloat(batch, actualSamples[batch], expectedSamples[batch], 0.00001f);
 
             float stats[N_BATCHES * VOCAB_STATS_TEST_SHARDS * NN_VOCAB_STATS_WIDTH];
-            device->data.buffers[1].get()->read((NnByte *)stats);
+            device->data.buffers[2].get()->read((NnByte *)stats);
             assertFloat(4u, stats[4], logits[2], 0.00001f);
             const NnUint secondBatchOffset = VOCAB_STATS_TEST_SHARDS * NN_VOCAB_STATS_WIDTH;
             assert(std::isinf(stats[secondBatchOffset + 4u]) && stats[secondBatchOffset + 4u] < 0.0f);
@@ -1831,6 +1831,57 @@ void testScaleScalar_F32_F32() {
         });
 }
 
+void testCrossSegmentBuffer_F32_F32() {
+    #define CROSS_SEGMENT_DIM 32
+    NnNetConfigBuilder netBuilder(1u, N_BATCHES);
+    NnNodeConfigBuilder nodeBuilder(0u);
+    const NnUint inputPipeIndex = netBuilder.addPipe(
+        "input", size2D(F_32, N_BATCHES, CROSS_SEGMENT_DIM));
+    const NnUint outputPipeIndex = netBuilder.addPipe(
+        "output", size2D(F_32, N_BATCHES, CROSS_SEGMENT_DIM));
+    const NnUint intermediateBufferIndex = nodeBuilder.addBuffer(
+        "intermediate", size2D(F_32, N_BATCHES, CROSS_SEGMENT_DIM));
+
+    NnSegmentConfigBuilder producer;
+    producer.addOp(OP_CAST, "produce", 0u,
+        pointerBatchConfig(SRC_PIPE, inputPipeIndex),
+        pointerBatchConfig(SRC_BUFFER, intermediateBufferIndex),
+        size0(), NnCastOpCodeConfig{});
+    nodeBuilder.addSegment(producer.build());
+
+    NnSegmentConfigBuilder consumer;
+    consumer.addOp(OP_SCALE, "consume", 0u,
+        pointerBatchConfig(SRC_BUFFER, intermediateBufferIndex),
+        pointerBatchConfig(SRC_PIPE, outputPipeIndex),
+        size0(), NnScaleOpCodeConfig{0u, 0.25f, 1u});
+    nodeBuilder.addSegment(consumer.build());
+
+    NnNetConfig netConfig = netBuilder.build();
+    NnNodeConfig nodeConfig = nodeBuilder.build();
+    std::unique_ptr<NnNetConfig, void(*)(NnNetConfig *)> netConfigPtr(
+        &netConfig, releaseNetConfig);
+    std::unique_ptr<NnNodeConfig, void(*)(NnNodeConfig *)> nodeConfigPtr(
+        &nodeConfig, releaseNodeConfig);
+    NnNetExecution execution(1u, &netConfig);
+    execution.setBatchSize(N_BATCHES);
+    std::vector<NnExecutorDevice> devices;
+    devices.push_back(NnExecutorDevice(
+        new NnVulkanDevice(0u, &netConfig, &nodeConfig, &execution), -1, -1));
+    NnFakeNodeSynchronizer synchronizer;
+    NnExecutor executor(&netConfig, &nodeConfig, &devices, &execution, &synchronizer, false);
+
+    float *input = reinterpret_cast<float *>(execution.pipes[inputPipeIndex]);
+    const float *output = reinterpret_cast<const float *>(execution.pipes[outputPipeIndex]);
+    for (NnUint pass = 0u; pass < 2u; ++pass) {
+        for (NnUint i = 0u; i < N_BATCHES * CROSS_SEGMENT_DIM; ++i)
+            input[i] = static_cast<float>(pass * 1000u + i) * 0.125f;
+        executor.forward();
+        for (NnUint i = 0u; i < N_BATCHES * CROSS_SEGMENT_DIM; ++i)
+            assertFloat(i, output[i], input[i] * 0.25f, 0.00001f);
+    }
+    printOk("testCrossSegmentBuffer_F32");
+}
+
 void testMoeGate_F32_F32() {
     #define MOE_GATE_F32_DIM 8
     #define MOE_GATE_F32_K 4
@@ -2024,6 +2075,7 @@ int main() {
 
     testScale_F32_F32();
     testScaleScalar_F32_F32();
+    testCrossSegmentBuffer_F32_F32();
 
     testMoeGate_F32_F32();
     testMoeGateWeightScale_F32_F32();
