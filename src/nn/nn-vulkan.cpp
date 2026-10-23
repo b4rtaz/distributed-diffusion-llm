@@ -630,9 +630,9 @@ static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuant
         if (quantType == F32_F32_F32) return "cast-forward-f32-f32.spv";
         if (quantType == F32_F32_Q80) return "cast-forward-f32-q80.spv";
     }
-    if (opCode == OP_REPEAT_Z) {
-        if (quantType == F32_F32_F32) return "repeatz-forward-f32-f32.spv";
-        if (quantType == F32_F32_Q80) return "repeatz-forward-f32-q80.spv";
+    if (opCode == OP_MOE_PACK) {
+        if (quantType == F32_F32_F32) return "moe-pack-forward-f32-f32.spv";
+        if (quantType == F32_F32_Q80) return "moe-pack-forward-f32-q80.spv";
     }
     if (opCode == OP_SHIFT) {
         if (quantType == F32_F32_F32) return "shift-forward-f32-f32.spv";
@@ -640,15 +640,18 @@ static const char *getShaderFileName(const NnOpConfig *opConfig, const NnOpQuant
     if (opCode == OP_SOFTMAX) {
         if (quantType == F32_F32_F32) return "softmax-forward-f32-f32.spv";
     }
-    if (opCode == OP_MOE_GATE) {
+    if (opCode == OP_MOE_ROUTE) {
         if (quantType == F32_F32_F32) {
-            const NnMoeGateOpCodeConfig *config = (NnMoeGateOpCodeConfig *)opConfig->config;
+            const NnMoeRouteOpConfig *config = (NnMoeRouteOpConfig *)opConfig->config;
             return config->expertScaleFromWeight == 0u
-                ? "moe-gate-forward-f32-f32.spv"
-                : "moe-gate-weight-forward-f32-f32-f32.spv";
+                ? "moe-route-forward-f32-f32.spv"
+                : "moe-route-weight-forward-f32-f32-f32.spv";
         }
-        if (quantType == F32_Q40_F32) throw std::invalid_argument("MOE_GATE expert scale must use F32 weights");
-        if (quantType == Q80_F32_F32) throw std::invalid_argument("MOE_GATE requires F32 input");
+        if (quantType == F32_Q40_F32) throw std::invalid_argument("MOE_ROUTE expert scale must use F32 weights");
+        if (quantType == Q80_F32_F32) throw std::invalid_argument("MOE_ROUTE requires F32 input");
+    }
+    if (opCode == OP_MOE_MERGE) {
+        if (quantType == F32_F32_F32) return "moe-merge-forward-f32-f32.spv";
     }
     throw std::invalid_argument(std::string("Unsupported shader: ") + opCodeToString(opCode) + "/" + opQuantTypeToString(quantType));
 }
@@ -680,6 +683,7 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
         case OP_MATMUL: {
             const NnMatmulOpConfig *config = (NnMatmulOpConfig *)opConfig->config;
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->activeExpertIndexesBufferIndex)});
+            a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->routeLayoutBufferIndex)});
         } break;
         case OP_SCALE: {
             const NnScaleOpCodeConfig *config = (NnScaleOpCodeConfig *)opConfig->config;
@@ -751,11 +755,21 @@ static void buildShaderLayout(std::vector<NnOpBufferAccess> &a, NnVulkanDeviceDa
             a.push_back({ACCESS_READONLY, data->resolvePipeByIndex(config->samplingCoinsPipeIndex)});
             a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->localLogitsBufferIndex)});
         } break;
-        case OP_MOE_GATE: {
-            const NnMoeGateOpCodeConfig *config = (NnMoeGateOpCodeConfig *)opConfig->config;
+        case OP_MOE_PACK: {
+            const NnMoePackOpConfig *config = (NnMoePackOpConfig *)opConfig->config;
+            a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->routeLayoutBufferIndex)});
+        } break;
+        case OP_MOE_ROUTE: {
+            const NnMoeRouteOpConfig *config = (NnMoeRouteOpConfig *)opConfig->config;
             a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->indexesBufferIndex)});
+            a.push_back({ACCESS_READ_WRITE, data->resolveBufferByIndex(config->routeLayoutBufferIndex)});
             if (config->expertScaleFromWeight == 0u)
                 a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->expertScaleBufferIndex)});
+        } break;
+        case OP_MOE_MERGE: {
+            const NnMoeMergeOpConfig *config = (NnMoeMergeOpConfig *)opConfig->config;
+            a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->weightsBufferIndex)});
+            a.push_back({ACCESS_READONLY, data->resolveBufferByIndex(config->routeLayoutBufferIndex)});
         } break;
         default:
             break;
@@ -835,7 +849,8 @@ static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, co
         opConfig->code == OP_MATMUL ||
         opConfig->code == OP_MERGE_SUM ||
         opConfig->code == OP_MUL ||
-        opConfig->code == OP_REPEAT_Z ||
+        opConfig->code == OP_MOE_PACK ||
+        opConfig->code == OP_MOE_MERGE ||
         opConfig->code == OP_SCALE ||
         opConfig->code == OP_SILU ||
         opConfig->code == OP_GELU ||
@@ -853,8 +868,8 @@ static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, co
             consts.push_back((inputBlocks + tileSizeX - 1u) / tileSizeX);
         }
     }
-    if (opConfig->code == OP_MOE_GATE) {
-        const NnMoeGateOpCodeConfig *config = (NnMoeGateOpCodeConfig *)opConfig->config;
+    if (opConfig->code == OP_MOE_ROUTE) {
+        const NnMoeRouteOpConfig *config = (NnMoeRouteOpConfig *)opConfig->config;
         consts.push_back(inputSize.x);
         consts.push_back(config->k);
     }
@@ -874,7 +889,7 @@ static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, co
 static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const NnSize3D inputSize, const NnSize3D outputSize) {
     if (
         opConfig->code == OP_CAST ||
-        opConfig->code == OP_REPEAT_Z
+        opConfig->code == OP_MOE_PACK
     ) {
         if (outputSize.floatType == F_Q80) {
             return outputSize.x / Q80_BLOCK_SIZE;
@@ -930,7 +945,8 @@ static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const
         opConfig->code == OP_SILU ||
         opConfig->code == OP_GELU ||
         opConfig->code == OP_TANH ||
-        opConfig->code == OP_MERGE_SUM
+        opConfig->code == OP_MERGE_SUM ||
+        opConfig->code == OP_MOE_MERGE
     ) {
         constexpr NnUint chunkSize = 4u; // Shader constant
         assert(outputSize.x % chunkSize == 0);
@@ -942,8 +958,8 @@ static NnUint resolveShaderNumberOfWorkGroupsX(const NnOpConfig *opConfig, const
 static NnUint resolveShaderNumberOfWorkGroupsZ(const NnOpConfig *opConfig, const NnSize3D inputSize, const NnSize3D outputSize) {
     if (
         opConfig->code == OP_MERGE_SUM ||
-        opConfig->code == OP_REPEAT_Z ||
-        opConfig->code == OP_MOE_GATE
+        opConfig->code == OP_MOE_ROUTE ||
+        opConfig->code == OP_MOE_MERGE
     ) {
         return 1u;
     }

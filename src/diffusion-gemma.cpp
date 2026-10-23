@@ -51,6 +51,7 @@ struct NodeBuilder {
     NnUint routerScores;
     NnUint expertIndexes;
     NnUint expertWeights;
+    NnUint expertRouteLayout;
     NnUint expertNorm;
     NnUint expertInput;
     NnUint expertGate;
@@ -167,6 +168,8 @@ struct NodeBuilder {
         routerScores = node.addBuffer("router_scores", size2D(F_32, batches, h.expertCount));
         expertIndexes = node.addBuffer("expert_indexes", size2D(F_32, batches, h.activeExpertCount));
         expertWeights = node.addBuffer("expert_weights", size3D(F_32, h.activeExpertCount, batches, 1u));
+        expertRouteLayout = node.addBuffer("expert_route_layout", size1D(F_32,
+            2u * batches * h.activeExpertCount + h.expertCount + 1u));
         expertNorm = node.addBuffer("expert_norm", size2D(F_32, batches, h.hiddenSize));
         expertInput = node.addBuffer("expert_input", size3D(matmulInputType, h.activeExpertCount, batches, h.hiddenSize));
         expertGate = node.addBuffer("expert_gate", size3D(F_32, h.activeExpertCount, batches, moe.physicalSize));
@@ -331,7 +334,9 @@ struct NodeBuilder {
         NnUint experts = 0u) {
         segment.addOp(OP_MATMUL, name.c_str(), 0u,
             pointerBatchConfig(SRC_BUFFER, input), pointerBatchConfig(SRC_BUFFER, output),
-            weightSize, weight, NnMatmulOpConfig{experts, experts == 0u ? 0u : h.activeExpertCount, expertIndexes});
+            weightSize, weight, NnMatmulOpConfig{
+                experts, experts == 0u ? 0u : h.activeExpertCount,
+                expertIndexes, expertRouteLayout});
     }
 
     void addInputSegment(bool decoder) {
@@ -549,15 +554,17 @@ struct NodeBuilder {
         s.addOp(OP_SOFTMAX, (p + "router.softmax").c_str(), 0u,
             pointerBatchConfig(SRC_BUFFER, routerScores), pointerBatchConfig(SRC_BUFFER, routerScores), size0(), NnSoftmaxOpCodeConfig{});
         const NnUint expertScale = layerOffset(layer, "router.per_expert_scale");
-        s.addOp(OP_MOE_GATE, bindings[expertScale].runtimeName.c_str(), 0u,
+        s.addOp(OP_MOE_ROUTE, bindings[expertScale].runtimeName.c_str(), 0u,
             pointerBatchConfig(SRC_BUFFER, routerScores), pointerBatchConfig(SRC_BUFFER, expertWeights),
             size1D(F_32, h.expertCount), expertScale,
-            NnMoeGateOpCodeConfig{h.activeExpertCount, 1u, expertIndexes, 0u, 1u, 1u});
+            NnMoeRouteOpConfig{
+                h.activeExpertCount, 1u, expertIndexes, 0u, 1u, 1u, expertRouteLayout});
 
         addNorm(s, pointerBatchConfig(SRC_BUFFER, x), pointerBatchConfig(SRC_BUFFER, expertNorm),
             layerOffset(layer, "pre_feedforward_layernorm_2.weight"), p + "pre_feedforward_layernorm_2.weight", h.hiddenSize);
-        s.addOp(OP_REPEAT_Z, (p + "experts.repeat").c_str(), 0u,
-            pointerBatchConfig(SRC_BUFFER, expertNorm), pointerBatchConfig(SRC_BUFFER, expertInput), size0(), NnRepeatZOpCodeConfig{});
+        s.addOp(OP_MOE_PACK, (p + "experts.pack").c_str(), 0u,
+            pointerBatchConfig(SRC_BUFFER, expertNorm), pointerBatchConfig(SRC_BUFFER, expertInput),
+            size0(), NnMoePackOpConfig{expertRouteLayout});
         addMatmul(s, p + "experts.gate", expertInput, expertGate,
             layerOffset(layer, "experts.gate"), size3D(weightType, h.expertCount, h.hiddenSize, moe.physicalSize), h.expertCount);
         addMatmul(s, p + "experts.up", expertInput, expertUp,
@@ -571,11 +578,10 @@ struct NodeBuilder {
             pointerBatchConfig(SRC_BUFFER, expertIntermediate), pointerBatchConfig(SRC_BUFFER, quantExpertIntermediate), size0(), NnCastOpCodeConfig{});
         addMatmul(s, p + "experts.down_proj", quantExpertIntermediate, expertOutput,
             layerOffset(layer, "experts.down_proj"), size3D(weightType, h.expertCount, moe.physicalSize, h.hiddenSize), h.expertCount);
-        s.addOp(OP_SCALE, (p + "experts.apply_weights").c_str(), 0u,
-            pointerBatchConfig(SRC_BUFFER, expertOutput), pointerBatchConfig(SRC_BUFFER, expertOutput), size0(),
-            NnScaleOpCodeConfig{expertWeights, 0.0f, 0u});
-        s.addOp(OP_MERGE_SUM, (p + "experts.sum").c_str(), 0u,
-            pointerBatchConfig(SRC_BUFFER, expertOutput), pointerBatchConfig(SRC_BUFFER, localMoe), size0(), NnMergeSumOpCodeConfig{0u});
+        s.addOp(OP_MOE_MERGE, (p + "experts.merge").c_str(), 0u,
+            pointerBatchConfig(SRC_BUFFER, expertOutput), pointerBatchConfig(SRC_BUFFER, localMoe),
+            size0(), NnMoeMergeOpConfig{
+                h.activeExpertCount, expertWeights, expertRouteLayout});
         s.addOp(OP_CAST, "feed_forward.pack_dense", layer,
             pointerBatchConfig(SRC_BUFFER, localDense), pointerBatchedGroupSliceConfig(SRC_PIPE, pipes.feedForwardSync, 0u, 2u), size0(), NnCastOpCodeConfig{});
         s.addOp(OP_CAST, "feed_forward.pack_moe", layer,
@@ -598,7 +604,7 @@ struct NodeBuilder {
         s.addOp(OP_MATMUL, "token_embedding.weight", 0u,
             pointerBatchConfig(SRC_BUFFER, quantHidden), pointerBatchConfig(SRC_BUFFER, localLogits),
             size2D(weightType, h.hiddenSize, localVocab()), embeddingWeight,
-            NnMatmulOpConfig{0u, 0u, expertIndexes});
+            NnMatmulOpConfig{0u, 0u, expertIndexes, expertRouteLayout});
         if (!decoder) {
             s.addOp(OP_SCALE, "logits.pre_softcap", 0u,
                 pointerBatchConfig(SRC_BUFFER, localLogits), pointerBatchConfig(SRC_BUFFER, localLogits), size0(),
@@ -632,7 +638,7 @@ struct NodeBuilder {
                 pointerBatchConfig(SRC_BUFFER, quantEmbeddingProbabilities),
                 pointerBatchConfig(SRC_BUFFER, embeddingNumerator),
                 size2D(weightType, localVocab(), h.hiddenSize),
-                embeddingMixWeight, NnMatmulOpConfig{0u, 0u, expertIndexes});
+                embeddingMixWeight, NnMatmulOpConfig{0u, 0u, expertIndexes, expertRouteLayout});
             maxima.addOp(OP_TIED_EMBEDDING_REDUCE, "embedding_mix.reduce_tiles", 0u,
                 pointerBatchConfig(SRC_BUFFER, partialEmbeddingMix),
                 pointerBatchedSliceConfig(SRC_PIPE, pipes.vocabularyMaxSync), size0(),

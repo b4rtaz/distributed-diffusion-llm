@@ -41,8 +41,10 @@ layout(binding = 4) readonly uniform opConfigBuffer {
     uint nExperts;
     uint nActiveExperts;
     uint activeExpertIndexesBufferIndex;
+    uint routeLayoutBufferIndex;
 };
 layout(binding = 5) readonly buffer activeExpertIndexesBuffer { float activeExpertIndexes[]; };
+layout(binding = 6) readonly buffer routeLayoutBuffer { float routeLayout[]; };
 
 shared float sums[N_THREADS * TILE_SIZE_D];
 
@@ -55,9 +57,13 @@ void main() {
     const uint b = zIndex * N_BATCHES + batchIndex;
     const BatchInfo info = infos[b];
 
-    const uint expertIndex = nExperts == 0
-        ? 0
-        : uint(activeExpertIndexes[batchIndex * nActiveExperts + zIndex]);
+    uint expertIndex = 0u;
+    if (nExperts != 0u) {
+        const uint original = uint(routeLayout[b]);
+        const uint originalBatch = original % N_BATCHES;
+        const uint originalSlot = original / N_BATCHES;
+        expertIndex = uint(activeExpertIndexes[originalBatch * nActiveExperts + originalSlot]);
+    }
     const uint expertOffset = expertIndex * info.inputSizeX * info.outputSizeX;
 
     const uint inputOffset = info.inputOffset;

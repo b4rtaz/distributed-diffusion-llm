@@ -124,12 +124,14 @@ static void testWeightedExpertScale() {
     const NnUint output = netBuilder.addPipe("weights", size3D(F_32, 2u, 1u, 1u));
     NnNodeConfigBuilder nodeBuilder(0u);
     const NnUint indexes = nodeBuilder.addBuffer("indexes", size2D(F_32, 1u, 2u));
+    const NnUint routeLayout = nodeBuilder.addBuffer("route_layout", size1D(F_32, 9u));
     const NnUint scales = nodeBuilder.addWeight("expert_scales", size1D(F_32, 4u));
     NnSegmentConfigBuilder segment;
     segment.addOp(
-        OP_MOE_GATE, "weighted_gate", 0u,
+        OP_MOE_ROUTE, "weighted_gate", 0u,
         pointerBatchConfig(SRC_PIPE, input), pointerBatchConfig(SRC_PIPE, output),
-        size1D(F_32, 4u), scales, NnMoeGateOpCodeConfig{2u, 1u, indexes, 0u, 1u, 1u});
+        size1D(F_32, 4u), scales,
+        NnMoeRouteOpConfig{2u, 1u, indexes, 0u, 1u, 1u, routeLayout});
     nodeBuilder.addSegment(segment.build());
     NnNetConfig net = netBuilder.build();
     NnNodeConfig node = nodeBuilder.build();
@@ -238,6 +240,86 @@ static void testPackedGroupedQuantizedReduction() {
     releaseNetConfig(&net);
 }
 
+static void testPackedExpertMatmulAndMerge() {
+    const NnUint maxBatches = 8u;
+    const NnUint batchSize = 7u;
+    const NnUint nExperts = 2u;
+    const NnUint nActiveExperts = 2u;
+    const NnUint dim = 4u;
+
+    NnNetConfigBuilder netBuilder(1u, maxBatches);
+    const NnUint scoresPipe = netBuilder.addPipe("scores", size2D(F_32, maxBatches, nExperts));
+    const NnUint inputPipe = netBuilder.addPipe("input", size2D(F_32, maxBatches, dim));
+    const NnUint outputPipe = netBuilder.addPipe("output", size2D(F_32, maxBatches, dim));
+    NnNodeConfigBuilder nodeBuilder(0u);
+    const NnUint indexes = nodeBuilder.addBuffer(
+        "expert_indexes", size2D(F_32, maxBatches, nActiveExperts));
+    const NnUint weights = nodeBuilder.addBuffer(
+        "expert_weights", size3D(F_32, nActiveExperts, maxBatches, 1u));
+    const NnUint routeLayout = nodeBuilder.addBuffer("expert_route_layout",
+        size1D(F_32, 2u * maxBatches * nActiveExperts + nExperts + 1u));
+    const NnUint packedInput = nodeBuilder.addBuffer(
+        "packed_input", size3D(F_32, nActiveExperts, maxBatches, dim));
+    const NnUint packedOutput = nodeBuilder.addBuffer(
+        "packed_output", size3D(F_32, nActiveExperts, maxBatches, dim));
+    const NnUint expertWeight = nodeBuilder.addWeight(
+        "expert_weight", size3D(F_32, nExperts, dim, dim));
+
+    NnSegmentConfigBuilder segment;
+    segment.addOp(OP_MOE_ROUTE, "moe_route", 0u,
+        pointerBatchConfig(SRC_PIPE, scoresPipe), pointerBatchConfig(SRC_BUFFER, weights),
+        size0(), NnMoeRouteOpConfig{
+            nActiveExperts, 0u, indexes, indexes, 0u, 0u, routeLayout});
+    segment.addOp(OP_MOE_PACK, "moe_pack", 0u,
+        pointerBatchConfig(SRC_PIPE, inputPipe), pointerBatchConfig(SRC_BUFFER, packedInput),
+        size0(), NnMoePackOpConfig{routeLayout});
+    segment.addOp(OP_MATMUL, "expert_matmul", 0u,
+        pointerBatchConfig(SRC_BUFFER, packedInput), pointerBatchConfig(SRC_BUFFER, packedOutput),
+        size3D(F_32, nExperts, dim, dim), expertWeight,
+        NnMatmulOpConfig{nExperts, nActiveExperts, indexes, routeLayout});
+    segment.addOp(OP_MOE_MERGE, "moe_merge", 0u,
+        pointerBatchConfig(SRC_BUFFER, packedOutput), pointerBatchConfig(SRC_PIPE, outputPipe),
+        size0(), NnMoeMergeOpConfig{nActiveExperts, weights, routeLayout});
+    nodeBuilder.addSegment(segment.build());
+
+    NnNetConfig net = netBuilder.build();
+    NnNodeConfig node = nodeBuilder.build();
+    NnNetExecution execution(4u, &net);
+    execution.setBatchSize(batchSize);
+    std::vector<NnExecutorDevice> devices;
+    devices.push_back(NnExecutorDevice(new NnCpuDevice(&net, &node, &execution), -1, -1));
+    NnFakeNodeSynchronizer synchronizer;
+    NnExecutor executor(&net, &node, &devices, &execution, &synchronizer, false);
+
+    float expertWeights[nExperts * dim * dim] = {};
+    for (NnUint expert = 0u; expert < nExperts; ++expert)
+        for (NnUint d = 0u; d < dim; ++d)
+            expertWeights[expert * dim * dim + d * dim + d] = (float)(expert + 1u);
+    executor.loadWeight("expert_matmul", 0u, 0u,
+        sizeof(expertWeights), (NnByte *)expertWeights);
+
+    float *scores = (float *)execution.pipes[scoresPipe];
+    float *input = (float *)execution.pipes[inputPipe];
+    for (NnUint batch = 0u; batch < batchSize; ++batch) {
+        scores[batch * nExperts] = 0.2f + 0.01f * (float)batch;
+        scores[batch * nExperts + 1u] = 0.8f - 0.02f * (float)batch;
+        for (NnUint d = 0u; d < dim; ++d)
+            input[batch * dim + d] = (float)(10u * batch + d + 1u);
+    }
+    executor.forward();
+
+    const float *output = (const float *)execution.pipes[outputPipe];
+    for (NnUint batch = 0u; batch < batchSize; ++batch) {
+        const float scale = scores[batch * nExperts] + 2.0f * scores[batch * nExperts + 1u];
+        for (NnUint d = 0u; d < dim; ++d)
+            assert(std::fabs(output[batch * dim + d] - input[batch * dim + d] * scale) < 0.0001f);
+    }
+
+    devices.clear();
+    releaseNodeConfig(&node);
+    releaseNetConfig(&net);
+}
+
 static void testDeviceBufferHandoff() {
     NnNetConfigBuilder netBuilder(1u, 1u);
     const NnUint pipe = netBuilder.addPipe("device_handoff", size2D(F_32, 1u, 4u));
@@ -292,6 +374,7 @@ int main() {
     testWeightedExpertScale();
     testPackedGroupedReduction();
     testPackedGroupedQuantizedReduction();
+    testPackedExpertMatmulAndMerge();
     testDeviceBufferHandoff();
 
     NnNetConfig netConfig;

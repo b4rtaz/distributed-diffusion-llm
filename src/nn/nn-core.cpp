@@ -84,10 +84,11 @@ const char *opCodeToString(NnOpCode code) {
     if (code == OP_MUL) return "MUL";
     if (code == OP_SCALE) return "SCALE";
     if (code == OP_CAST) return "CAST";
-    if (code == OP_REPEAT_Z) return "REPEAT_Z";
+    if (code == OP_MOE_PACK) return "MOE_PACK";
     if (code == OP_SHIFT) return "SHIFT";
     if (code == OP_SOFTMAX) return "SOFTMAX";
-    if (code == OP_MOE_GATE) return "MOE_GATE";
+    if (code == OP_MOE_ROUTE) return "MOE_ROUTE";
+    if (code == OP_MOE_MERGE) return "MOE_MERGE";
     if (code == OP_DIFFUSION_ATTENTION) return "DIFFUSION_ATTENTION";
     if (code == OP_TIED_EMBEDDING_PARTIAL) return "TIED_EMBEDDING_PARTIAL";
     if (code == OP_TANH) return "TANH";

@@ -1,0 +1,97 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+layout(constant_id = 1) const uint N_EXPERTS = 16;
+layout(constant_id = 2) const uint K = 2;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[K * N_BATCHES]; };
+layout(binding = 3) readonly uniform opConfigBuffer {
+    uint k;
+    uint normTopk;
+    uint indexesBufferIndex;
+    uint expertScaleBufferIndex;
+    uint hasExpertScale;
+    uint expertScaleFromWeight;
+    uint routeLayoutBufferIndex;
+};
+layout(binding = 4) buffer indexesBuffer { float indexes[]; };
+layout(binding = 5) buffer routeLayoutBuffer { float routeLayout[]; };
+layout(binding = 6) readonly buffer expertScaleBuffer { float expertScale[]; };
+
+void main() {
+    if (gl_WorkGroupID.y != 0u)
+        return;
+    const uint batchSize = gl_NumWorkGroups.y;
+    for (uint batch = 0u; batch < batchSize; ++batch) {
+        float topValues[K];
+        uint topIndexes[K];
+        for (uint selected = 0u; selected < K; ++selected) {
+            topValues[selected] = -3.402823466e+38f;
+            topIndexes[selected] = 0u;
+        }
+        const BatchInfo info = infos[batch];
+        for (uint expert = 0u; expert < N_EXPERTS; ++expert) {
+            const float value = x[info.inputOffset + expert];
+            for (uint selected = 0u; selected < K; ++selected) {
+                if (value > topValues[selected]) {
+                    for (uint shift = K - 1u; shift > selected; --shift) {
+                        topValues[shift] = topValues[shift - 1u];
+                        topIndexes[shift] = topIndexes[shift - 1u];
+                    }
+                    topValues[selected] = value;
+                    topIndexes[selected] = expert;
+                    break;
+                }
+            }
+        }
+        float sum = 1.0f;
+        if (normTopk != 0u) {
+            sum = 0.0f;
+            for (uint selected = 0u; selected < K; ++selected)
+                sum += topValues[selected];
+        }
+        for (uint selected = 0u; selected < K; ++selected) {
+            const uint expert = topIndexes[selected];
+            indexes[batch * K + selected] = float(expert);
+            const float scale = hasExpertScale == 0u ? 1.0f : expertScale[expert];
+            y[infos[selected * N_BATCHES + batch].outputOffset] =
+                topValues[selected] / sum * scale;
+        }
+    }
+
+    const uint capacity = N_BATCHES * K;
+    uint cursors[N_EXPERTS];
+    for (uint expert = 0u; expert < N_EXPERTS; ++expert)
+        cursors[expert] = 0u;
+    for (uint batch = 0u; batch < batchSize; ++batch)
+        for (uint slot = 0u; slot < K; ++slot)
+            ++cursors[uint(indexes[batch * K + slot])];
+    uint total = 0u;
+    for (uint expert = 0u; expert < N_EXPERTS; ++expert) {
+        routeLayout[2u * capacity + expert] = float(total);
+        total += cursors[expert];
+        cursors[expert] = uint(routeLayout[2u * capacity + expert]);
+    }
+    routeLayout[2u * capacity + N_EXPERTS] = float(total);
+    for (uint batch = 0u; batch < batchSize; ++batch) {
+        for (uint slot = 0u; slot < K; ++slot) {
+            const uint expert = uint(indexes[batch * K + slot]);
+            const uint logical = cursors[expert]++;
+            const uint packed = (logical / batchSize) * N_BATCHES + logical % batchSize;
+            const uint original = slot * N_BATCHES + batch;
+            routeLayout[packed] = float(original);
+            routeLayout[capacity + original] = float(packed);
+        }
+    }
+}

@@ -1,0 +1,42 @@
+#version 450
+
+#define CHUNK_SIZE 4
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint N_BATCHES = 32;
+layout(constant_id = 1) const uint N_Z = 1;
+
+struct BatchInfo {
+    uint inputOffset;
+    uint inputSizeX;
+    uint outputOffset;
+    uint outputSizeX;
+};
+
+layout(binding = 0) readonly buffer inputBuffer { float x[]; };
+layout(binding = 1) writeonly buffer outputBuffer { float y[]; };
+layout(binding = 2) readonly uniform batchInfosBuffer { BatchInfo infos[N_Z * N_BATCHES]; };
+layout(binding = 3) readonly uniform opConfigBuffer {
+    uint nActiveExperts;
+    uint weightsBufferIndex;
+    uint routeLayoutBufferIndex;
+};
+layout(binding = 4) readonly buffer weightsBuffer { float weights[]; };
+layout(binding = 5) readonly buffer routeLayoutBuffer { float routeLayout[]; };
+
+void main() {
+    const uint batchIndex = gl_WorkGroupID.y;
+    const uint offset = gl_WorkGroupID.x * CHUNK_SIZE;
+    const uint routeCapacity = N_BATCHES * nActiveExperts;
+    const BatchInfo outputInfo = infos[batchIndex];
+    for (uint i = 0u; i < CHUNK_SIZE; ++i) {
+        float sum = 0.0f;
+        for (uint slot = 0u; slot < nActiveExperts; ++slot) {
+            const uint original = slot * N_BATCHES + batchIndex;
+            const uint packed = uint(routeLayout[routeCapacity + original]);
+            sum += weights[original] * x[infos[packed].inputOffset + offset + i];
+        }
+        y[outputInfo.outputOffset + offset + i] = sum;
+    }
+}

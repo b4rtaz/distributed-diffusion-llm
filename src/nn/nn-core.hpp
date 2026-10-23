@@ -91,10 +91,11 @@ enum NnOpCode {
     OP_MUL,
     OP_SCALE,
     OP_CAST,
-    OP_REPEAT_Z,
+    OP_MOE_PACK,
     OP_SHIFT,
     OP_SOFTMAX,
-    OP_MOE_GATE,
+    OP_MOE_ROUTE,
+    OP_MOE_MERGE,
     OP_DIFFUSION_ATTENTION,
     OP_TIED_EMBEDDING_PARTIAL,
     OP_TANH,
@@ -245,6 +246,7 @@ typedef struct {
     NnUint nExperts;
     NnUint nActiveExperts;
     NnUint activeExpertIndexesBufferIndex;
+    NnUint routeLayoutBufferIndex;
 } NnMatmulOpConfig;
 
 typedef struct {
@@ -307,8 +309,8 @@ typedef struct {
 } NnCastOpCodeConfig;
 
 typedef struct {
-    // empty
-} NnRepeatZOpCodeConfig;
+    NnUint routeLayoutBufferIndex;
+} NnMoePackOpConfig;
 
 typedef struct {
     NnUint indexPipeIndex;
@@ -326,7 +328,14 @@ typedef struct {
     NnUint expertScaleBufferIndex;
     NnUint hasExpertScale;
     NnUint expertScaleFromWeight;
-} NnMoeGateOpCodeConfig;
+    NnUint routeLayoutBufferIndex;
+} NnMoeRouteOpConfig;
+
+typedef struct {
+    NnUint nActiveExperts;
+    NnUint weightsBufferIndex;
+    NnUint routeLayoutBufferIndex;
+} NnMoeMergeOpConfig;
 
 enum NnDiffusionAttentionMode {
     DIFFUSION_ATTENTION_ENCODER_CAUSAL = 0,

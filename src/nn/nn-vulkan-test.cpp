@@ -557,30 +557,140 @@ void testMulWeight_F32_F32() {
         });
 }
 
-void testRepeatZ_F32_F32() {
+void testMoePack_F32_F32() {
     #define REPEAT_Z_DIM 8
     #define REPEAT_Z_COUNT 3
     execute(
-        [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *, NnSegmentConfigBuilder *segmentBuilder) {
+        [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *nodeBuilder, NnSegmentConfigBuilder *segmentBuilder) {
             const NnUint inputPipeIndex = netBuilder->addPipe("input", size2D(F_32, N_BATCHES, REPEAT_Z_DIM));
             const NnUint outputPipeIndex = netBuilder->addPipe("output",
                 size3D(F_32, REPEAT_Z_COUNT, N_BATCHES, REPEAT_Z_DIM));
-            segmentBuilder->addOp(OP_REPEAT_Z, "repeat_z", 0u,
+            const NnUint routeLayout = nodeBuilder->addBuffer("route_layout",
+                size1D(F_32, 2u * REPEAT_Z_COUNT * N_BATCHES + 1u));
+            segmentBuilder->addOp(OP_MOE_PACK, "moe_pack", 0u,
                 pointerBatchConfig(SRC_PIPE, inputPipeIndex), pointerBatchConfig(SRC_PIPE, outputPipeIndex),
-                size0(), NnRepeatZOpCodeConfig{});
+                size0(), NnMoePackOpConfig{routeLayout});
         },
-        [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *) {
+        [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             execution->setBatchSize(N_BATCHES);
             float *input = (float *)execution->pipes[0];
             for (NnUint i = 0u; i < N_BATCHES * REPEAT_Z_DIM; ++i)
                 input[i] = (float)(i + 1u);
+            float routeLayout[2u * REPEAT_Z_COUNT * N_BATCHES + 1u] = {};
+            for (NnUint z = 0u; z < REPEAT_Z_COUNT; ++z)
+                for (NnUint batch = 0u; batch < N_BATCHES; ++batch)
+                    routeLayout[z * N_BATCHES + batch] = (float)(z * N_BATCHES + batch);
+            device->data.buffers[0].get()->write((NnByte *)routeLayout);
             executor->forward();
             const float *output = (const float *)execution->pipes[1];
             for (NnUint z = 0u; z < REPEAT_Z_COUNT; ++z)
                 for (NnUint i = 0u; i < N_BATCHES * REPEAT_Z_DIM; ++i)
                     assertFloat(z * N_BATCHES * REPEAT_Z_DIM + i,
                         output[z * N_BATCHES * REPEAT_Z_DIM + i], input[i], 0.00001f);
-            printOk("testRepeatZ_F32_F32");
+            printOk("testMoePack_F32_F32");
+        });
+}
+
+void testMoePack_F32_Q80() {
+    #define MOE_PACK_Q80_DIM 32
+    #define MOE_PACK_Q80_K 2
+    execute(
+        [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *nodeBuilder,
+            NnSegmentConfigBuilder *segmentBuilder) {
+            const NnUint inputPipe = netBuilder->addPipe("input",
+                size2D(F_32, N_BATCHES, MOE_PACK_Q80_DIM));
+            const NnUint outputPipe = netBuilder->addPipe("output",
+                size3D(F_Q80, MOE_PACK_Q80_K, N_BATCHES, MOE_PACK_Q80_DIM));
+            const NnUint routeLayout = nodeBuilder->addBuffer("route_layout",
+                size1D(F_32, 2u * MOE_PACK_Q80_K * N_BATCHES + 1u));
+            segmentBuilder->addOp(OP_MOE_PACK, "moe_pack_q80", 0u,
+                pointerBatchConfig(SRC_PIPE, inputPipe), pointerBatchConfig(SRC_PIPE, outputPipe),
+                size0(), NnMoePackOpConfig{routeLayout});
+        },
+        [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
+            const NnUint batchSize = N_BATCHES - 1u;
+            execution->setBatchSize(batchSize);
+            float *input = (float *)execution->pipes[0];
+            for (NnUint batch = 0u; batch < batchSize; ++batch)
+                for (NnUint d = 0u; d < MOE_PACK_Q80_DIM; ++d)
+                    input[batch * MOE_PACK_Q80_DIM + d] =
+                        0.1f * (float)(10u * batch + d + 1u);
+            float routeLayout[2u * MOE_PACK_Q80_K * N_BATCHES + 1u] = {};
+            for (NnUint z = 0u; z < MOE_PACK_Q80_K; ++z)
+                for (NnUint batch = 0u; batch < batchSize; ++batch) {
+                    const NnUint packed = z * N_BATCHES + batch;
+                    const NnUint originalBatch = (batch + z) % batchSize;
+                    routeLayout[packed] = (float)(z * N_BATCHES + originalBatch);
+                }
+            device->data.buffers[0].get()->write((NnByte *)routeLayout);
+            executor->forward();
+
+            const NnBlockQ80 *output = (const NnBlockQ80 *)execution->pipes[1];
+            float unpacked[MOE_PACK_Q80_DIM];
+            for (NnUint z = 0u; z < MOE_PACK_Q80_K; ++z)
+                for (NnUint batch = 0u; batch < batchSize; ++batch) {
+                    const NnUint packed = z * N_BATCHES + batch;
+                    const NnUint originalBatch = (batch + z) % batchSize;
+                    dequantizeQ80toF32(output + packed, unpacked,
+                        MOE_PACK_Q80_DIM, 1u, 0u);
+                    for (NnUint d = 0u; d < MOE_PACK_Q80_DIM; ++d)
+                        assertFloat(packed * MOE_PACK_Q80_DIM + d, unpacked[d],
+                            input[originalBatch * MOE_PACK_Q80_DIM + d], 0.02f);
+                }
+            printOk("testMoePack_F32_Q80");
+        });
+}
+
+void testMoeMerge_F32_F32() {
+    #define MOE_MERGE_DIM 8
+    #define MOE_MERGE_K 2
+    execute(
+        [](NnNetConfigBuilder *netBuilder, NnNodeConfigBuilder *nodeBuilder,
+            NnSegmentConfigBuilder *segmentBuilder) {
+            const NnUint inputPipe = netBuilder->addPipe("input",
+                size3D(F_32, MOE_MERGE_K, N_BATCHES, MOE_MERGE_DIM));
+            const NnUint outputPipe = netBuilder->addPipe("output",
+                size2D(F_32, N_BATCHES, MOE_MERGE_DIM));
+            const NnUint weights = nodeBuilder->addBuffer("weights",
+                size3D(F_32, MOE_MERGE_K, N_BATCHES, 1u));
+            const NnUint routeLayout = nodeBuilder->addBuffer("route_layout",
+                size1D(F_32, 2u * MOE_MERGE_K * N_BATCHES + 1u));
+            segmentBuilder->addOp(OP_MOE_MERGE, "moe_merge", 0u,
+                pointerBatchConfig(SRC_PIPE, inputPipe), pointerBatchConfig(SRC_PIPE, outputPipe),
+                size0(), NnMoeMergeOpConfig{MOE_MERGE_K, weights, routeLayout});
+        },
+        [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
+            execution->setBatchSize(N_BATCHES);
+            const NnUint routeCount = MOE_MERGE_K * N_BATCHES;
+            const NnUint packedToOriginal[routeCount] = {0u, 2u, 4u, 6u, 1u, 3u, 5u, 7u};
+            float routeLayout[2u * routeCount + 1u] = {};
+            float weights[routeCount];
+            float *input = (float *)execution->pipes[0];
+            for (NnUint packed = 0u; packed < routeCount; ++packed) {
+                const NnUint original = packedToOriginal[packed];
+                routeLayout[packed] = (float)original;
+                routeLayout[routeCount + original] = (float)packed;
+                weights[original] = 0.1f * (float)(original + 1u);
+                for (NnUint d = 0u; d < MOE_MERGE_DIM; ++d)
+                    input[packed * MOE_MERGE_DIM + d] =
+                        (float)(10u * (original + 1u) + d);
+            }
+            device->data.buffers[0].get()->write((NnByte *)weights);
+            device->data.buffers[1].get()->write((NnByte *)routeLayout);
+            executor->forward();
+
+            const float *output = (const float *)execution->pipes[1];
+            for (NnUint batch = 0u; batch < N_BATCHES; ++batch)
+                for (NnUint d = 0u; d < MOE_MERGE_DIM; ++d) {
+                    float expected = 0.0f;
+                    for (NnUint slot = 0u; slot < MOE_MERGE_K; ++slot) {
+                        const NnUint original = slot * N_BATCHES + batch;
+                        expected += weights[original] * (float)(10u * (original + 1u) + d);
+                    }
+                    assertFloat(batch * MOE_MERGE_DIM + d,
+                        output[batch * MOE_MERGE_DIM + d], expected, 0.0001f);
+                }
+            printOk("testMoeMerge_F32_F32");
         });
 }
 
@@ -1564,12 +1674,15 @@ void testMatmul_F32_F32_F32_expert() {
             NnUint xPipeIndex = netBuilder->addPipe("X", size3D(F_32, MATMUL_F32_A, N_BATCHES, MATMUL_F32_N));
             NnUint yPipeIndex = netBuilder->addPipe("Y", size3D(F_32, MATMUL_F32_A, N_BATCHES, MATMUL_F32_D));
             NnUint activeExpertIndexesIndex = nodeBuilder->addBuffer("indexes", size2D(F_32, N_BATCHES, MATMUL_F32_A));
+            NnUint routeLayoutIndex = nodeBuilder->addBuffer("route_layout",
+                size1D(F_32, 2u * N_BATCHES * MATMUL_F32_A + MATMUL_F32_E + 1u));
             segmentBuilder->addOp(
                 OP_MATMUL, "matmul", 0u,
                 pointerBatchConfig(SRC_PIPE, xPipeIndex),
                 pointerBatchConfig(SRC_PIPE, yPipeIndex),
                 size3D(F_32, MATMUL_F32_E, MATMUL_F32_N, MATMUL_F32_D),
-                NnMatmulOpConfig{MATMUL_F32_E, MATMUL_F32_A, activeExpertIndexesIndex});
+                NnMatmulOpConfig{
+                    MATMUL_F32_E, MATMUL_F32_A, activeExpertIndexesIndex, routeLayoutIndex});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             // arrange
@@ -1590,23 +1703,30 @@ void testMatmul_F32_F32_F32_expert() {
 
             for (NnUint i = 0u; i < MATMUL_F32_A * N_BATCHES; i++)
                 indexes[i] = (float)(i % MATMUL_F32_E); // 0, 1, 2, 3, 0, 1, 2, 3, ...
-            for (NnUint i = 0; i < MATMUL_F32_A * N_BATCHES * MATMUL_F32_N; i++)
-                xPipe[i] = (float)(i / MATMUL_F32_N + 1); // 1.0, 1.0, ... 2.0, 2.0, ...
+            const NnUint packedToOriginal[MATMUL_F32_A * N_BATCHES] = {
+                0u, 2u, 4u, 6u, 1u, 3u, 5u, 7u};
+            for (NnUint packed = 0u; packed < MATMUL_F32_A * N_BATCHES; ++packed)
+                for (NnUint i = 0u; i < MATMUL_F32_N; ++i)
+                    xPipe[packed * MATMUL_F32_N + i] = (float)(packedToOriginal[packed] + 1u);
 
             device->data.buffers[0].get()->write((NnByte *)indexes);
+            float routeLayout[2u * MATMUL_F32_A * N_BATCHES + MATMUL_F32_E + 1u] = {};
+            for (NnUint packed = 0u; packed < MATMUL_F32_A * N_BATCHES; ++packed)
+                routeLayout[packed] = (float)packedToOriginal[packed];
+            device->data.buffers[1].get()->write((NnByte *)routeLayout);
 
             executor->forward();
 
-            float t = 0.0001f;
-            assertFloat(0, yPipe[0], 0.1f /* index=0, e=0 */ * (4 * 1.0f), t);
-            assertFloat(1, yPipe[1], 0.3f /* index=2, e=2 */ * (4 * 2.0f), t);
-            assertFloat(2, yPipe[2], 0.1f /* index=4, e=0 */ * (4 * 3.0f), t);
-            assertFloat(3, yPipe[3], 0.3f /* index=6, e=2 */ * (4 * 4.0f), t);
-
-            assertFloat(4, yPipe[4], 0.2f /* index=1, e=1 */ * (4 * 5.0f), t);
-            assertFloat(5, yPipe[5], 0.4f /* index=3, e=3 */ * (4 * 6.0f), t);
-            assertFloat(6, yPipe[6], 0.2f /* index=5, e=1 */ * (4 * 7.0f), t);
-            assertFloat(7, yPipe[7], 0.4f /* index=7, e=3 */ * (4 * 8.0f), t);
+            const float t = 0.0001f;
+            for (NnUint packed = 0u; packed < MATMUL_F32_A * N_BATCHES; ++packed) {
+                const NnUint original = packedToOriginal[packed];
+                const NnUint slot = original / N_BATCHES;
+                const NnUint batch = original % N_BATCHES;
+                const NnUint expert = (NnUint)indexes[batch * MATMUL_F32_A + slot];
+                assertFloat(packed, yPipe[packed],
+                    0.1f * (float)(expert + 1u) *
+                    (float)(MATMUL_F32_N * (original + 1u)), t);
+            }
 
             printOk("testMatmul_F32_F32_F32_expert");
         });
@@ -1882,7 +2002,7 @@ void testCrossSegmentBuffer_F32_F32() {
     printOk("testCrossSegmentBuffer_F32");
 }
 
-void testMoeGate_F32_F32() {
+void testMoeRoute_F32_F32() {
     #define MOE_GATE_F32_DIM 8
     #define MOE_GATE_F32_K 4
     execute(
@@ -1890,11 +2010,15 @@ void testMoeGate_F32_F32() {
             NnUint xPipeIndex = netBuilder->addPipe("X", size2D(F_32, N_BATCHES, MOE_GATE_F32_DIM));
             NnUint gPipeIndex = netBuilder->addPipe("g", size3D(F_32, MOE_GATE_F32_K, N_BATCHES, 1u));
             NnUint indexesBufferIndex = nodeBuilder->addBuffer("i", size2D(F_32, N_BATCHES, MOE_GATE_F32_K));
-            segmentBuilder->addOp(OP_MOE_GATE, "moe_gate", 0,
+            NnUint routeLayoutBufferIndex = nodeBuilder->addBuffer("route_layout",
+                size1D(F_32, 2u * N_BATCHES * MOE_GATE_F32_K + MOE_GATE_F32_DIM + 1u));
+            segmentBuilder->addOp(OP_MOE_ROUTE, "moe_route", 0,
                 pointerBatchConfig(SRC_PIPE, xPipeIndex),
                 pointerBatchConfig(SRC_PIPE, gPipeIndex),
                 size0(),
-                NnMoeGateOpCodeConfig{MOE_GATE_F32_K, 0u, indexesBufferIndex});
+                NnMoeRouteOpConfig{
+                    MOE_GATE_F32_K, 0u, indexesBufferIndex, 0u, 0u, 0u,
+                    routeLayoutBufferIndex});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             // arrange
@@ -1929,11 +2053,11 @@ void testMoeGate_F32_F32() {
             assertFloat(102, pos[2], 2.0f, t);
             assertFloat(103, pos[3], 3.0f, t);
 
-            printOk("testMoeGate_F32_F32");
+            printOk("testMoeRoute_F32_F32");
         });
 }
 
-void testMoeGateWeightScale_F32_F32() {
+void testMoeRouteWeightScale_F32_F32() {
     #define MOE_GATE_WEIGHT_DIM 8
     #define MOE_GATE_WEIGHT_K 4
     execute(
@@ -1944,11 +2068,14 @@ void testMoeGateWeightScale_F32_F32() {
                 "g", size3D(F_32, MOE_GATE_WEIGHT_K, N_BATCHES, 1u));
             const NnUint indexesBufferIndex = nodeBuilder->addBuffer(
                 "i", size2D(F_32, N_BATCHES, MOE_GATE_WEIGHT_K));
-            segmentBuilder->addOp(OP_MOE_GATE, "moe_gate_weight", 0u,
+            const NnUint routeLayoutBufferIndex = nodeBuilder->addBuffer("route_layout",
+                size1D(F_32, 2u * N_BATCHES * MOE_GATE_WEIGHT_K + MOE_GATE_WEIGHT_DIM + 1u));
+            segmentBuilder->addOp(OP_MOE_ROUTE, "moe_route_weight", 0u,
                 pointerBatchConfig(SRC_PIPE, xPipeIndex), pointerBatchConfig(SRC_PIPE, gPipeIndex),
                 size1D(F_32, MOE_GATE_WEIGHT_DIM),
-                NnMoeGateOpCodeConfig{
-                    MOE_GATE_WEIGHT_K, 1u, indexesBufferIndex, 0u, 1u, 1u});
+                NnMoeRouteOpConfig{
+                    MOE_GATE_WEIGHT_K, 1u, indexesBufferIndex, 0u, 1u, 1u,
+                    routeLayoutBufferIndex});
         },
         [](NnExecutor *executor, NnNetExecution *execution, NnVulkanDevice *device) {
             execution->setBatchSize(N_BATCHES);
@@ -1958,7 +2085,7 @@ void testMoeGateWeightScale_F32_F32() {
             for (NnUint batch = 0u; batch < N_BATCHES; ++batch)
                 std::copy(scores, scores + MOE_GATE_WEIGHT_DIM,
                     x + batch * MOE_GATE_WEIGHT_DIM);
-            executor->loadWeight("moe_gate_weight", 0u, 0u, sizeof(scales), (NnByte *)scales);
+            executor->loadWeight("moe_route_weight", 0u, 0u, sizeof(scales), (NnByte *)scales);
             executor->forward();
 
             const NnUint expectedIndexes[MOE_GATE_WEIGHT_K] = {4u, 7u, 2u, 3u};
@@ -1975,7 +2102,7 @@ void testMoeGateWeightScale_F32_F32() {
                         indexes[batch * MOE_GATE_WEIGHT_K + selected],
                         (float)expectedIndexes[selected], 0.00001f);
                 }
-            printOk("testMoeGateWeightScale_F32_F32");
+            printOk("testMoeRouteWeightScale_F32_F32");
         });
 }
 
@@ -2049,7 +2176,9 @@ int main() {
     testCast_F32_Q80<256, 1>();
     testCast_F32_Q80<64, 4>();
 
-    testRepeatZ_F32_F32();
+    testMoePack_F32_F32();
+    testMoePack_F32_Q80();
+    testMoeMerge_F32_F32();
 
     testRopeLlama_F32_F32();
     testRopeFalcon_F32_F32();
@@ -2077,7 +2206,7 @@ int main() {
     testScaleScalar_F32_F32();
     testCrossSegmentBuffer_F32_F32();
 
-    testMoeGate_F32_F32();
-    testMoeGateWeightScale_F32_F32();
+    testMoeRoute_F32_F32();
+    testMoeRouteWeightScale_F32_F32();
     return 0;
 }

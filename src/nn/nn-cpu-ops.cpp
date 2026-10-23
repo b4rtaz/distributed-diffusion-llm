@@ -1316,7 +1316,7 @@ static void routeExperts_F32(
         for (NnUint i = 0u; i < k; i++)
             sum += probabilities[indexes[i]];
         if (!(sum > 0.0f) || !std::isfinite(sum))
-            throw std::runtime_error("MOE_GATE normalized top-k sum must be finite and positive");
+            throw std::runtime_error("MOE_ROUTE normalized top-k sum must be finite and positive");
     }
     for (NnUint i = 0u; i < k; i++) {
         const NnUint expert = indexes[i];
@@ -1700,7 +1700,7 @@ static void rmsNormForward_Q80_F32_F32(NnUint nThreads, NnUint threadIndex, NnUi
 }
 
 static void initMatmulForward(NnCpuOpContext *context) {
-    const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
+    const NnMatmulOpConfig *config = (const NnMatmulOpConfig *)context->opConfig;
     ASSERT_EQ(context->inputSize.y, context->nBatches);
     ASSERT_EQ(context->outputSize.y, context->nBatches);
     ASSERT_EQ(context->inputSize.x, context->weightSize.y);
@@ -1708,6 +1708,13 @@ static void initMatmulForward(NnCpuOpContext *context) {
     ASSERT_EQ(context->outputSize.x, context->weightSize.x);
     ASSERT_EQ(context->outputSize.z, std::max(config->nActiveExperts, 1u));
     ASSERT_EQ(context->weightSize.z, std::max(config->nExperts, 1u));
+    if (config->nExperts != 0u) {
+        const NnSize3D *routeLayout =
+            &context->bufferConfigs[config->routeLayoutBufferIndex].size;
+        ASSERT_EQ(routeLayout->floatType, F_32);
+        assert(routeLayout->length >=
+            2u * context->nBatches * config->nActiveExperts + config->nExperts + 1u);
+    }
 
     if (!context->hasInputContinuousMemory)
         printf("🚧 Op %s does not have contiguous memory for input\n", context->name);
@@ -1717,7 +1724,9 @@ static void initMatmulForward(NnCpuOpContext *context) {
 }
 
 static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
-    if (batchSize == 1u || !context->hasInputContinuousMemory || !context->hasOutputContinuousMemory || context->inputSize.z != 1u)
+    const NnMatmulOpConfig *config = (const NnMatmulOpConfig *)context->opConfig;
+    if (config->nExperts != 0u || batchSize == 1u || !context->hasInputContinuousMemory ||
+        !context->hasOutputContinuousMemory || context->inputSize.z != 1u)
         return false;
 
     const NnUint n = context->weightSize.y / getBlockSize(context->inputSize.floatType);
@@ -1734,58 +1743,92 @@ static bool matmulForward_llamafile(NnUint nThreads, NnUint threadIndex, NnUint 
     );
 }
 
+static const float *resolveExpertOffsets(
+    const NnCpuOpContext *context,
+    const NnMatmulOpConfig *config)
+{
+    const NnSize routeCapacity = context->nBatches * config->nActiveExperts;
+    return (const float *)context->buffers[config->routeLayoutBufferIndex] + 2u * routeCapacity;
+}
+
+static NnUint resolvePackedRouteIndex(
+    const NnUint logicalIndex,
+    const NnUint batchSize,
+    const NnUint nBatches)
+{
+    return (logicalIndex / batchSize) * nBatches + logicalIndex % batchSize;
+}
+
 static void matmulForward_F32_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    const NnMatmulOpConfig *config = (const NnMatmulOpConfig *)context->opConfig;
     if (matmulForward_llamafile(nThreads, threadIndex, batchSize, context))
         return;
-
-    const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
-    const NnUint nActiveExpertsOr1 = std::max(config->nActiveExperts, 1u);
-    const float *activeExpertIndexes = (const float *)context->buffers[config->activeExpertIndexesBufferIndex];
-
-    for (NnUint y = 0; y < batchSize; y++) {
-        for (NnUint e = 0; e < nActiveExpertsOr1; e++) {
-            const NnUint activeExpertIndex = config->nActiveExperts == 0u
-                ? 0u
-                : (NnUint)activeExpertIndexes[y * config->nActiveExperts + e];
-
-            float *output = (float *)context->output[e * context->outputSize.y + y];
-            matmul_F32_F32_F32(
-                output,
-                (float *)context->input[e * context->inputSize.y + y],
-                (float *)&context->weight[activeExpertIndex * context->weightSize.nBytesXY],
-                context->weightSize.y,
-                context->weightSize.x,
-                nThreads,
-                threadIndex);
-            DEBUG_VECTOR(context, "output", output);
+    const bool experts = config->nExperts != 0u;
+    const float *expertOffsets = experts ? resolveExpertOffsets(context, config) : nullptr;
+    const NnUint n = context->weightSize.y;
+    const NnUint d = context->weightSize.x;
+    for (NnUint expert = 0u; expert < std::max(config->nExperts, 1u); ++expert) {
+        NnUint logical = experts ? (NnUint)expertOffsets[expert] : 0u;
+        const NnUint logicalEnd = experts ? (NnUint)expertOffsets[expert + 1u] : batchSize;
+        while (logical < logicalEnd) {
+            const NnUint y = logical % batchSize;
+            const NnUint count = experts
+                ? std::min(logicalEnd - logical, batchSize - y)
+                : 1u;
+            const NnUint packed = experts
+                ? resolvePackedRouteIndex(logical, batchSize, context->nBatches)
+                : logical;
+            const float *weight = (const float *)&context->weight[
+                expert * context->weightSize.nBytesXY];
+            const bool handled = experts && count > 1u && llamafile_sgemm(
+                d, count, n, weight, n,
+                context->input[packed], n, context->output[packed], d,
+                threadIndex, nThreads, 0, F_32, F_32, F_32);
+            if (!handled) {
+                for (NnUint i = 0u; i < count; ++i)
+                    matmul_F32_F32_F32(
+                        (float *)context->output[packed + i],
+                        (const float *)context->input[packed + i],
+                        weight, n, d, nThreads, threadIndex);
+            }
+            logical += count;
         }
     }
 }
 
 static void matmulForward_Q80_Q40_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    const NnMatmulOpConfig *config = (const NnMatmulOpConfig *)context->opConfig;
     if (matmulForward_llamafile(nThreads, threadIndex, batchSize, context))
         return;
-
-    const NnMatmulOpConfig *config = (NnMatmulOpConfig *)context->opConfig;
-    const NnUint nActiveExpertsOr1 = std::max(config->nActiveExperts, 1u);
-    const float *activeExpertIndexes = (const float *)context->buffers[config->activeExpertIndexesBufferIndex];
-
-    for (NnUint y = 0; y < batchSize; y++) {
-        for (NnUint e = 0; e < nActiveExpertsOr1; e++) {
-            const NnUint activeExpertIndex = config->nActiveExperts == 0u
-                ? 0u
-                : (NnUint)activeExpertIndexes[y * config->nActiveExperts + e];
-
-            float *output = (float *)context->output[e * context->outputSize.y + y];
-            matmul_Q80_Q40_F32(
-                output,
-                (NnBlockQ80 *)context->input[e * context->inputSize.y + y],
-                (NnBlockQ40 *)&context->weight[activeExpertIndex * context->weightSize.nBytesXY],
-                context->weightSize.y,
-                context->weightSize.x,
-                nThreads,
-                threadIndex);
-            DEBUG_VECTOR(context, "output", output);
+    const bool experts = config->nExperts != 0u;
+    const float *expertOffsets = experts ? resolveExpertOffsets(context, config) : nullptr;
+    const NnUint n = context->weightSize.y / Q80_BLOCK_SIZE;
+    const NnUint d = context->weightSize.x;
+    for (NnUint expert = 0u; expert < std::max(config->nExperts, 1u); ++expert) {
+        NnUint logical = experts ? (NnUint)expertOffsets[expert] : 0u;
+        const NnUint logicalEnd = experts ? (NnUint)expertOffsets[expert + 1u] : batchSize;
+        while (logical < logicalEnd) {
+            const NnUint y = logical % batchSize;
+            const NnUint count = experts
+                ? std::min(logicalEnd - logical, batchSize - y)
+                : 1u;
+            const NnUint packed = experts
+                ? resolvePackedRouteIndex(logical, batchSize, context->nBatches)
+                : logical;
+            const NnBlockQ40 *weight = (const NnBlockQ40 *)&context->weight[
+                expert * context->weightSize.nBytesXY];
+            const bool handled = experts && count > 1u && llamafile_sgemm(
+                d, count, n, weight, n,
+                context->input[packed], n, context->output[packed], d,
+                threadIndex, nThreads, 0, F_Q40, F_Q80, F_32);
+            if (!handled) {
+                for (NnUint i = 0u; i < count; ++i)
+                    matmul_Q80_Q40_F32(
+                        (float *)context->output[packed + i],
+                        (const NnBlockQ80 *)context->input[packed + i],
+                        weight, context->weightSize.y, d, nThreads, threadIndex);
+            }
+            logical += count;
         }
     }
 }
@@ -2580,47 +2623,51 @@ static void castForward_Q80_F32(NnUint nThreads, NnUint threadIndex, NnUint batc
     }
 }
 
-static void initRepeatZForward(NnCpuOpContext *context) {
+static void initMoePackForward(NnCpuOpContext *context) {
+    const NnMoePackOpConfig *config = (const NnMoePackOpConfig *)context->opConfig;
     ASSERT_EQ(context->inputSize.x, context->outputSize.x);
     ASSERT_EQ(context->inputSize.y, context->outputSize.y);
     ASSERT_EQ(context->inputSize.z, 1u);
-    assert(context->inputSize.z <= context->outputSize.z);
-    assert(context->inputSize.z > 0u);
+    assert(context->outputSize.z > 0u);
+    const NnSize3D *routeLayout = &context->bufferConfigs[config->routeLayoutBufferIndex].size;
+    ASSERT_EQ(routeLayout->floatType, F_32);
+    assert(routeLayout->length >= 2u * context->nBatches * context->outputSize.z);
 }
 
-static void repeatZForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+static void moePackForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_32);
+    const NnMoePackOpConfig *config = (const NnMoePackOpConfig *)context->opConfig;
+    const float *packedToOriginal = (const float *)context->buffers[config->routeLayoutBufferIndex];
     const NnSize rowBytes = getBytes(F_32, context->outputSize.x);
     for (NnUint z = 0u; z < context->outputSize.z; ++z) {
-        for (NnUint y = 0u; y < batchSize; ++y)
-            copy_UNK(context->output[z * context->outputSize.y + y], context->input[y], rowBytes, nThreads, threadIndex);
+        for (NnUint y = 0u; y < batchSize; ++y) {
+            const NnUint packed = z * context->nBatches + y;
+            const NnUint original = (NnUint)packedToOriginal[packed];
+            const NnUint originalBatch = original % context->nBatches;
+            copy_UNK(context->output[packed], context->input[originalBatch],
+                rowBytes, nThreads, threadIndex);
+        }
     }
 }
 
-static void repeatZForward_F32_Q80(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+static void moePackForward_F32_Q80(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
     ASSERT_EQ(context->inputSize.floatType, F_32);
     ASSERT_EQ(context->outputSize.floatType, F_Q80);
-    const NnSize dimSize = getBytes(F_Q80, context->outputSize.x);
+    const NnMoePackOpConfig *config = (const NnMoePackOpConfig *)context->opConfig;
+    const float *packedToOriginal = (const float *)context->buffers[config->routeLayoutBufferIndex];
 
     for (NnUint z = 0u; z < context->outputSize.z; z++) {
         for (NnUint y = 0u; y < batchSize; y++) {
-            NnByte *output = context->output[z * context->outputSize.y + y];
-            if (z == 0u) {
-                quantizeF32toQ80(
-                    (float *)context->input[y],
-                    (NnBlockQ80 *)output,
-                    context->outputSize.x,
-                    nThreads,
-                    threadIndex);
-            } else {
-                copy_UNK(
-                    output,
-                    context->output[y],
-                    dimSize,
-                    nThreads,
-                    threadIndex);
-            }
+            const NnUint packed = z * context->nBatches + y;
+            const NnUint original = (NnUint)packedToOriginal[packed];
+            const NnUint originalBatch = original % context->nBatches;
+            quantizeF32toQ80(
+                (const float *)context->input[originalBatch],
+                (NnBlockQ80 *)context->output[packed],
+                context->outputSize.x,
+                nThreads,
+                threadIndex);
         }
     }
 }
@@ -2703,14 +2750,18 @@ static void softmaxForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint b
             context->outputSize.x);
 }
 
-static void initMoeGateForward(NnCpuOpContext *context) {
-    const NnMoeGateOpCodeConfig *config = (NnMoeGateOpCodeConfig *)context->opConfig;
+static void initMoeRouteForward(NnCpuOpContext *context) {
+    const NnMoeRouteOpConfig *config = (const NnMoeRouteOpConfig *)context->opConfig;
     ASSERT_EQ(context->inputSize.z, 1u);
     ASSERT_EQ(context->inputSize.y, context->nBatches);
     assert(context->inputSize.x >= config->k);
     ASSERT_EQ(context->outputSize.z, config->k);
     ASSERT_EQ(context->outputSize.y, context->nBatches);
     ASSERT_EQ(context->outputSize.x, 1u);
+    const NnSize3D *routeLayout = &context->bufferConfigs[config->routeLayoutBufferIndex].size;
+    ASSERT_EQ(routeLayout->floatType, F_32);
+    assert(routeLayout->length >=
+        2u * context->nBatches * config->k + context->inputSize.x + 1u);
     if (config->hasExpertScale != 0u) {
         if (config->expertScaleFromWeight != 0u) {
             ASSERT_EQ(context->weightSize.floatType, F_32);
@@ -2723,16 +2774,23 @@ static void initMoeGateForward(NnCpuOpContext *context) {
     }
 }
 
-static void moeGateForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
-    const NnMoeGateOpCodeConfig *config = (NnMoeGateOpCodeConfig *)context->opConfig;
+static void moeRouteForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint batchSize, NnCpuOpContext *context) {
+    if (threadIndex != 0u)
+        return;
+    const NnMoeRouteOpConfig *config = (const NnMoeRouteOpConfig *)context->opConfig;
     float *indexes = (float *)context->buffers[config->indexesBufferIndex];
+    float *routeLayout = (float *)context->buffers[config->routeLayoutBufferIndex];
+    const NnSize routeCapacity = context->nBatches * config->k;
+    float *packedToOriginal = routeLayout;
+    float *originalToPacked = routeLayout + routeCapacity;
+    float *expertOffsets = routeLayout + 2u * routeCapacity;
     const float *expertScale = config->hasExpertScale == 0u ? nullptr
         : config->expertScaleFromWeight != 0u ? (const float *)context->weight
         : (const float *)context->buffers[config->expertScaleBufferIndex];
 
     std::vector<NnUint> pos(config->k);
     std::vector<float> weights(config->k);
-    for (NnUint y = threadIndex; y < batchSize; y += nThreads) {
+    for (NnUint y = 0u; y < batchSize; ++y) {
         float *input = (float *)context->input[y];
         routeExperts_F32(input, context->inputSize.x, config->k, config->normTopk == 1u,
             expertScale, pos.data(), weights.data());
@@ -2747,6 +2805,76 @@ static void moeGateForward_F32_F32(NnUint nThreads, NnUint threadIndex, NnUint b
         }
 
         DEBUG_VECTOR(context, "indexes", (&indexes[y * config->k]));
+    }
+
+    std::vector<NnUint> counts(context->inputSize.x, 0u);
+    for (NnUint y = 0u; y < batchSize; ++y)
+        for (NnUint slot = 0u; slot < config->k; ++slot)
+            ++counts[(NnUint)indexes[y * config->k + slot]];
+    NnUint total = 0u;
+    for (NnUint expert = 0u; expert < context->inputSize.x; ++expert) {
+        expertOffsets[expert] = (float)total;
+        total += counts[expert];
+        counts[expert] = (NnUint)expertOffsets[expert];
+    }
+    expertOffsets[context->inputSize.x] = (float)total;
+    for (NnUint y = 0u; y < batchSize; ++y) {
+        for (NnUint slot = 0u; slot < config->k; ++slot) {
+            const NnUint expert = (NnUint)indexes[y * config->k + slot];
+            const NnUint logical = counts[expert]++;
+            const NnUint packed = resolvePackedRouteIndex(
+                logical, batchSize, context->nBatches);
+            const NnUint original = slot * context->nBatches + y;
+            packedToOriginal[packed] = (float)original;
+            originalToPacked[original] = (float)packed;
+        }
+    }
+    ASSERT_EQ(total, batchSize * config->k);
+    (void)nThreads;
+}
+
+static void initMoeMergeForward(NnCpuOpContext *context) {
+    const NnMoeMergeOpConfig *config = (const NnMoeMergeOpConfig *)context->opConfig;
+    ASSERT_EQ(context->inputSize.floatType, F_32);
+    ASSERT_EQ(context->outputSize.floatType, F_32);
+    ASSERT_EQ(context->inputSize.x, context->outputSize.x);
+    ASSERT_EQ(context->inputSize.y, context->nBatches);
+    ASSERT_EQ(context->outputSize.y, context->nBatches);
+    ASSERT_EQ(context->inputSize.z, config->nActiveExperts);
+    ASSERT_EQ(context->outputSize.z, 1u);
+    const NnSize3D *weights = &context->bufferConfigs[config->weightsBufferIndex].size;
+    ASSERT_EQ(weights->floatType, F_32);
+    ASSERT_EQ(weights->x, 1u);
+    ASSERT_EQ(weights->y, context->nBatches);
+    ASSERT_EQ(weights->z, config->nActiveExperts);
+    const NnSize3D *routeLayout = &context->bufferConfigs[config->routeLayoutBufferIndex].size;
+    ASSERT_EQ(routeLayout->floatType, F_32);
+    assert(routeLayout->length >= 2u * context->nBatches * config->nActiveExperts);
+}
+
+static void moeMergeForward_F32_F32(
+    NnUint nThreads,
+    NnUint threadIndex,
+    NnUint batchSize,
+    NnCpuOpContext *context)
+{
+    const NnMoeMergeOpConfig *config = (const NnMoeMergeOpConfig *)context->opConfig;
+    const NnSize routeCapacity = context->nBatches * config->nActiveExperts;
+    const float *originalToPacked =
+        (const float *)context->buffers[config->routeLayoutBufferIndex] + routeCapacity;
+    const float *weights = (const float *)context->buffers[config->weightsBufferIndex];
+    SPLIT_THREADS(start, end, context->outputSize.x, nThreads, threadIndex);
+    for (NnUint y = 0u; y < batchSize; ++y) {
+        float *output = (float *)context->output[y];
+        for (NnUint x = start; x < end; ++x) {
+            float sum = 0.0f;
+            for (NnUint slot = 0u; slot < config->nActiveExperts; ++slot) {
+                const NnUint original = slot * context->nBatches + y;
+                const NnUint packed = (NnUint)originalToPacked[original];
+                sum += weights[original] * ((const float *)context->input[packed])[x];
+            }
+            output[x] = sum;
+        }
     }
 }
 
@@ -2789,12 +2917,14 @@ NnCpuOpForwardInit getCpuOpForwardInit(NnOpCode code, NnOpQuantType quantType) {
         return initMulForward;
     if (code == OP_CAST)
         return initCastForward;
-    if (code == OP_REPEAT_Z)
-        return initRepeatZForward;
+    if (code == OP_MOE_PACK)
+        return initMoePackForward;
     if (code == OP_SHIFT)
         return initShiftForward;
-    if (code == OP_MOE_GATE)
-        return initMoeGateForward;
+    if (code == OP_MOE_ROUTE)
+        return initMoeRouteForward;
+    if (code == OP_MOE_MERGE)
+        return initMoeMergeForward;
     if (code == OP_DIFFUSION_ATTENTION)
         return initDiffusionAttentionForward;
     if (code == OP_TIED_EMBEDDING_PARTIAL)
@@ -2863,9 +2993,9 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
         if (quantType == Q80_Q80_Q80) return castForward_ANY;
         if (quantType == Q80_Q80_F32) return castForward_Q80_F32;
     }
-    if (code == OP_REPEAT_Z) {
-        if (quantType == F32_F32_F32) return repeatZForward_F32_F32;
-        if (quantType == F32_F32_Q80) return repeatZForward_F32_Q80;
+    if (code == OP_MOE_PACK) {
+        if (quantType == F32_F32_F32) return moePackForward_F32_F32;
+        if (quantType == F32_F32_Q80) return moePackForward_F32_Q80;
     }
     if (code == OP_SHIFT) {
         if (quantType == F32_F32_F32) return shiftForward_F32_F32;
@@ -2873,8 +3003,11 @@ NnCpuOpForward getCpuOpForward(NnOpCode code, NnOpQuantType quantType) {
     if (code == OP_SOFTMAX) {
         if (quantType == F32_F32_F32) return softmaxForward_F32_F32;
     }
-    if (code == OP_MOE_GATE) {
-        if (quantType == F32_F32_F32) return moeGateForward_F32_F32;
+    if (code == OP_MOE_ROUTE) {
+        if (quantType == F32_F32_F32) return moeRouteForward_F32_F32;
+    }
+    if (code == OP_MOE_MERGE) {
+        if (quantType == F32_F32_F32) return moeMergeForward_F32_F32;
     }
     if (code == OP_DIFFUSION_ATTENTION) {
         if (quantType == F32_F32_F32) return diffusionAttentionForward_F32_F32;

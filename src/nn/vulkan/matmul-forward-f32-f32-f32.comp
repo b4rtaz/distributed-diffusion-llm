@@ -22,8 +22,10 @@ layout(binding = 4) readonly uniform opConfigBuffer {
     uint nExperts;
     uint nActiveExperts;
     uint activeExpertIndexesBufferIndex;
+    uint routeLayoutBufferIndex;
 };
 layout(binding = 5) readonly buffer activeExpertIndexesBuffer { float activeExpertIndexes[]; };
+layout(binding = 6) readonly buffer routeLayoutBuffer { float routeLayout[]; };
 
 void main() {
     const uint threadIndex = gl_LocalInvocationID.x;
@@ -38,9 +40,14 @@ void main() {
     const uint dim = slice + (workGroupIndex < rest ? 1 : 0);
     const uint offset = workGroupIndex * slice + min(workGroupIndex, rest);
 
-    const uint expertIndex = nExperts == 0
-        ? 0
-        : uint(activeExpertIndexes[batchIndex * nActiveExperts + zIndex]);
+    uint expertIndex = 0u;
+    if (nExperts != 0u) {
+        const uint packed = zIndex * N_BATCHES + batchIndex;
+        const uint original = uint(routeLayout[packed]);
+        const uint originalBatch = original % N_BATCHES;
+        const uint originalSlot = original / N_BATCHES;
+        expertIndex = uint(activeExpertIndexes[originalBatch * nActiveExperts + originalSlot]);
+    }
     const uint expertOffset = expertIndex * info.inputSizeX * info.outputSizeX;
 
     const uint inputSizeX = info.inputSizeX;
