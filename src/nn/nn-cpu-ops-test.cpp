@@ -338,11 +338,19 @@ void testLlamafileSgemm() {
 }
 
 void testScale() {
-    float i[] = {1.0f, 2.0f, 3.0f, 4.0f};
-    float o[4];
-    scale_F32(i, o, 0.5f, 4u, 1u, 0u);
-    float expectedOutput[] = {0.5f, 1.0f, 1.5f, 2.0f};
-    compare_F32("scale_F32", o, expectedOutput, 4u, 0.00001f);
+    constexpr NnUint size = 29u;
+    constexpr NnUint nThreads = 3u;
+    float input[size];
+    float output[size];
+    float expected[size];
+    for (NnUint i = 0u; i < size; i++) {
+        input[i] = (float)i - 5.0f;
+        output[i] = NAN;
+        expected[i] = input[i] * 0.5f;
+    }
+    for (NnUint threadIndex = 0u; threadIndex < nThreads; threadIndex++)
+        scale_F32(input, output, 0.5f, size, nThreads, threadIndex);
+    compare_F32("scale_F32", output, expected, size, 0.00001f);
 }
 
 void testTanh() {

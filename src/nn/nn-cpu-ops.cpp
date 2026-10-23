@@ -1157,7 +1157,7 @@ static void mul_F32(float *y, const float *x, const float *m, const NnUint n, co
 
 #if defined(__ARM_NEON)
     const unsigned int count = end - start;
-    const unsigned int neonEnd = end - (count % 8);
+    const unsigned int neonEnd = end - (count % 4);
     for (; i < neonEnd; i += 4) {
         float32x4_t out_vec = vld1q_f32(&x[i]);
         float32x4_t x_vec = vld1q_f32(&m[i]);
@@ -1179,7 +1179,22 @@ static void mul_F32(float *y, const float *x, const float *m, const NnUint n, co
 }
 
 static void scale_F32(const float *i, float *o, const float s, NnSize size, NnUint nThreads, NnUint threadIndex) {
-    for (NnUint x = threadIndex; x < size; x += nThreads)
+    SPLIT_THREADS(start, end, size, nThreads, threadIndex);
+    NnUint x = start;
+#if defined(__ARM_NEON)
+    const float32x4_t scale = vdupq_n_f32(s);
+    for (; x + 4u <= end; x += 4u) {
+        const float32x4_t input = vld1q_f32(i + x);
+        vst1q_f32(o + x, vmulq_f32(input, scale));
+    }
+#elif defined(__AVX2__)
+    const __m256 scale = _mm256_set1_ps(s);
+    for (; x + 8u <= end; x += 8u) {
+        const __m256 input = _mm256_loadu_ps(i + x);
+        _mm256_storeu_ps(o + x, _mm256_mul_ps(input, scale));
+    }
+#endif
+    for (; x < end; x++)
         o[x] = i[x] * s;
 }
 
