@@ -244,23 +244,18 @@ void testSoftmax() {
 }
 
 void testSilu() {
-    std::vector<float> y(8);
-    for (NnUint i = 0; i < 8; i++)
-        y[i] = i / 8.0f;
-
-    silu_F32(y.data(), 8, 1, 0);
-
-    float expectedOutput[8] = {
-        0.000000f,
-        0.066401f,
-        0.140544f,
-        0.222250f,
-        0.311233f,
-        0.407116f,
-        0.509461f,
-        0.617802f
-    };
-    compare_F32("silu_F32", y.data(), expectedOutput, 8, 0.001);
+    constexpr NnUint size = 37u;
+    constexpr NnUint nThreads = 3u;
+    float output[size];
+    float expected[size];
+    for (NnUint i = 0u; i < size; i++) {
+        const float x = ((float)i - 18.0f) * 0.25f;
+        output[i] = x;
+        expected[i] = x / (1.0f + expf(-x));
+    }
+    for (NnUint threadIndex = 0u; threadIndex < nThreads; threadIndex++)
+        silu_F32(output, size, nThreads, threadIndex);
+    compare_F32("silu_F32", output, expected, size, 0.0001f);
 }
 
 // matmul
@@ -354,13 +349,33 @@ void testScale() {
 }
 
 void testTanh() {
-    float output[] = {-3.0f, -1.0f, 0.0f, 1.0f, 3.0f};
-    float expected[5];
-    for (NnUint i = 0u; i < 5u; i++)
+    constexpr NnUint size = 41u;
+    constexpr NnUint nThreads = 3u;
+    float output[size];
+    float expected[size];
+    for (NnUint i = 0u; i < size; i++) {
+        output[i] = ((float)i - 20.0f) * 0.5f;
         expected[i] = tanhf(output[i]);
+    }
+    for (NnUint threadIndex = 0u; threadIndex < nThreads; threadIndex++)
+        tanh_F32(output, size, nThreads, threadIndex);
+    compare_F32("tanh_F32", output, expected, size, 0.000001f);
+}
 
-    tanh_F32(output, 5u, 1u, 0u);
-    compare_F32("tanh_F32", output, expected, 5u, 0.000001f);
+void testGelu() {
+    constexpr NnUint size = 41u;
+    constexpr NnUint nThreads = 3u;
+    float output[size];
+    float expected[size];
+    for (NnUint i = 0u; i < size; i++) {
+        const float x = ((float)i - 20.0f) * 0.25f;
+        output[i] = x;
+        expected[i] = 0.5f * x *
+            (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
+    }
+    for (NnUint threadIndex = 0u; threadIndex < nThreads; threadIndex++)
+        gelu_F32(output, size, nThreads, threadIndex);
+    compare_F32("gelu_F32", output, expected, size, 0.000001f);
 }
 
 void testShiftSlots() {
@@ -1186,6 +1201,7 @@ int main() {
     testLlamafileSgemm();
     testScale();
     testTanh();
+    testGelu();
     testShiftSlots();
     testTopk();
     testTiedEmbeddingPartialTail();

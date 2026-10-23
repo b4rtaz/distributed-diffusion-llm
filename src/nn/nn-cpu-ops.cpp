@@ -34,39 +34,6 @@
 
 #if defined(__ARM_NEON)
 static inline float32x4_t expf_neon(float32x4_t x) {
-    const float32x4_t ln2 = vdupq_n_f32(0.69314718056f);
-    const float32x4_t inv_ln2 = vdupq_n_f32(1.44269504089f);
-    const float32x4_t c1 = vdupq_n_f32(1.0f);
-    const float32x4_t c2 = vdupq_n_f32(0.5f);
-    const float32x4_t c3 = vdupq_n_f32(0.1666666667f);
-    const float32x4_t c4 = vdupq_n_f32(0.04166666667f);
-    const float32x4_t c5 = vdupq_n_f32(0.008333333333f);
-
-    x = vminq_f32(x, vdupq_n_f32(88.0f));
-    x = vmaxq_f32(x, vdupq_n_f32(-88.0f));
-
-    float32x4_t kf = vaddq_f32(vmulq_f32(x, inv_ln2), vdupq_n_f32(0.5f));
-    int32x4_t k = vcvtq_s32_f32(kf);
-    kf = vcvtq_f32_s32(k);
-
-    float32x4_t f = vmlsq_f32(x, kf, ln2);
-    float32x4_t f2 = vmulq_f32(f, f);
-    float32x4_t f3 = vmulq_f32(f2, f);
-    float32x4_t f4 = vmulq_f32(f3, f);
-    float32x4_t f5 = vmulq_f32(f4, f);
-    float32x4_t p = c1;
-    p = vaddq_f32(p, f);
-    p = vaddq_f32(p, vmulq_f32(c2, f2));
-    p = vaddq_f32(p, vmulq_f32(c3, f3));
-    p = vaddq_f32(p, vmulq_f32(c4, f4));
-    p = vaddq_f32(p, vmulq_f32(c5, f5));
-
-    int32x4_t pow2k = vshlq_n_s32(vaddq_s32(k, vdupq_n_s32(127)), 23);
-    float32x4_t two_k = vreinterpretq_f32_s32(pow2k);
-    return vmulq_f32(p, two_k);
-}
-
-static inline float32x4_t tiedEmbeddingExp_NEON(float32x4_t x) {
     const float32x4_t minimum = vdupq_n_f32(-87.33654475f);
     const float32x4_t maximum = vdupq_n_f32(88.0f);
     const float32x4_t invLn2 = vdupq_n_f32(1.44269504088896341f);
@@ -94,14 +61,15 @@ static inline float32x4_t tiedEmbeddingExp_NEON(float32x4_t x) {
     polynomial = vfmaq_f32(vdupq_n_f32(1.0f), polynomial, reduced);
     polynomial = vfmaq_f32(vdupq_n_f32(1.0f), polynomial, reduced);
 
-    const int32x4_t scaleBits = vshlq_n_s32(vaddq_s32(exponent, vdupq_n_s32(127)), 23);
+    const int32x4_t scaleBits = vshlq_n_s32(
+        vaddq_s32(exponent, vdupq_n_s32(127)), 23);
     return vmulq_f32(polynomial, vreinterpretq_f32_s32(scaleBits));
 }
 
 static inline float32x4_t tiedEmbeddingTanh_NEON(float32x4_t x) {
     const uint32x4_t negative = vcltq_f32(x, vdupq_n_f32(0.0f));
     const float32x4_t absolute = vabsq_f32(x);
-    const float32x4_t exponential = tiedEmbeddingExp_NEON(vmulq_n_f32(absolute, -2.0f));
+    const float32x4_t exponential = expf_neon(vmulq_n_f32(absolute, -2.0f));
     const float32x4_t numerator = vsubq_f32(vdupq_n_f32(1.0f), exponential);
     const float32x4_t denominator = vaddq_f32(vdupq_n_f32(1.0f), exponential);
     float32x4_t reciprocal = vrecpeq_f32(denominator);
@@ -551,7 +519,33 @@ static void matmul_Q80_Q40_F32(float *output, const NnBlockQ80 *x, const NnBlock
 
 static void gelu_F32(float *output, const unsigned int n, const NnUint nThreads, const NnUint threadIndex) {
     SPLIT_THREADS(start, end, n, nThreads, threadIndex);
-    for (unsigned int i = start; i < end; i++) {
+    unsigned int i = start;
+#if defined(__ARM_NEON)
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    for (; i + 4u <= end; i += 4u) {
+        const float32x4_t x = vld1q_f32(output + i);
+        const float32x4_t x2 = vmulq_f32(x, x);
+        const float32x4_t inner = vfmaq_n_f32(one, x2, GELU_COEF_A);
+        const float32x4_t argument = vmulq_n_f32(vmulq_f32(x, inner), SQRT_2_OVER_PI);
+        const float32x4_t result = vmulq_n_f32(
+            vmulq_f32(x, vaddq_f32(one, tiedEmbeddingTanh_NEON(argument))), 0.5f);
+        vst1q_f32(output + i, result);
+    }
+#elif defined(__AVX2__)
+    const __m256 one = _mm256_set1_ps(1.0f);
+    for (; i + 8u <= end; i += 8u) {
+        const __m256 x = _mm256_loadu_ps(output + i);
+        const __m256 x2 = _mm256_mul_ps(x, x);
+        const __m256 inner = _mm256_fmadd_ps(x2, _mm256_set1_ps(GELU_COEF_A), one);
+        const __m256 argument = _mm256_mul_ps(
+            _mm256_mul_ps(x, inner), _mm256_set1_ps(SQRT_2_OVER_PI));
+        const __m256 result = _mm256_mul_ps(
+            _mm256_mul_ps(x, _mm256_add_ps(one, tiedEmbeddingTanh_AVX2(argument))),
+            _mm256_set1_ps(0.5f));
+        _mm256_storeu_ps(output + i, result);
+    }
+#endif
+    for (; i < end; i++) {
         float x = output[i];
         output[i] = 0.5f * x * (1.0f + tanhf(SQRT_2_OVER_PI * x * (1.0f + GELU_COEF_A * x * x)));
     }
@@ -599,7 +593,19 @@ static void silu_F32(float *output, const unsigned int n, const NnUint nThreads,
 
 static void tanh_F32(float *output, const NnUint n, const NnUint nThreads, const NnUint threadIndex) {
     SPLIT_THREADS(start, end, n, nThreads, threadIndex);
-    for (NnUint i = start; i < end; i++)
+    NnUint i = start;
+#if defined(__ARM_NEON)
+    for (; i + 4u <= end; i += 4u) {
+        const float32x4_t input = vld1q_f32(output + i);
+        vst1q_f32(output + i, tiedEmbeddingTanh_NEON(input));
+    }
+#elif defined(__AVX2__)
+    for (; i + 8u <= end; i += 8u) {
+        const __m256 input = _mm256_loadu_ps(output + i);
+        _mm256_storeu_ps(output + i, tiedEmbeddingTanh_AVX2(input));
+    }
+#endif
+    for (; i < end; i++)
         output[i] = tanhf(output[i]);
 }
 
@@ -1088,7 +1094,7 @@ static void tiedEmbeddingPartial_F32(
         float32x4_t denominatorVec = vdupq_n_f32(0.0f);
         for (; token + 4u <= vocabSize; token += 4u) {
             const float32x4_t logit = vld1q_f32(logits + token);
-            const float32x4_t probability = tiedEmbeddingExp_NEON(
+            const float32x4_t probability = expf_neon(
                 vsubq_f32(vmulq_f32(logit, inverseTemperatureVec), maximumVec2));
             vst1q_f32(probabilities + batch * vocabSize + token, probability);
             denominatorVec = vaddq_f32(denominatorVec, probability);
@@ -2266,7 +2272,7 @@ static inline void vocabLocalStatsAccumulate_NEON(
         // subtracting the maximum and accumulating the two reported moments.
         const float32x4_t scaled = vmulq_f32(logits, inverseTemperatureVec);
         const float32x4_t shiftedF32 = vsubq_f32(scaled, globalMaxVec);
-        const float32x4_t weights = tiedEmbeddingExp_NEON(shiftedF32);
+        const float32x4_t weights = expf_neon(shiftedF32);
         const float64x2_t weightLow = vcvt_f64_f32(vget_low_f32(weights));
         const float64x2_t weightHigh = vcvt_f64_f32(vget_high_f32(weights));
         const float64x2_t shiftedLow = vsubq_f64(
