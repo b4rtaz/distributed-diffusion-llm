@@ -5,6 +5,7 @@
 #include "nn/nn-quants.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -211,21 +212,28 @@ void inference(DiffusionGemmaAppContext *context) {
     const ExecutionTotals promptTotals = encodeChunks(context, prompt, &position);
     std::printf("%s\n", context->args->prompt.c_str());
     context->tokenizer->resetDecoder();
+    const std::chrono::steady_clock::time_point generationStart = std::chrono::steady_clock::now();
     const GenerationMetrics metrics = generate(context, &position, context->args->steps - position, 0u,
         [context](std::int32_t token) {
             const std::string piece = context->tokenizer->decodeToken(token, false);
             if (!piece.empty()) { std::fwrite(piece.data(), 1u, piece.size(), stdout); std::fflush(stdout); }
         });
+    const double generationSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - generationStart).count();
+    const double generationTokensPerSecond = generationSeconds == 0.0
+        ? 0.0
+        : static_cast<double>(metrics.tokens) / generationSeconds;
     const std::string tail = context->tokenizer->flushDecoder();
     if (!tail.empty()) std::fwrite(tail.data(), 1u, tail.size(), stdout);
     NnSize sent = 0u, received = 0u;
     if (context->network != NULL) context->network->getStats(&sent, &received);
     std::printf("\n\nGeneration\n  tokens: %u\n  canvases: %u\n  decoder forwards: %u\n"
+        "  speed: %.3f tokens/s\n"
         "  tokens/decoder forward: %.3f\n"
         "  encoder execute/sync: %.1f / %.1f ms\n"
         "  decoder execute/sync: %.1f / %.1f ms\n"
         "  sent: %zu kB\n  received: %zu kB\n",
-        metrics.tokens, metrics.canvases, metrics.decoderForwards,
+        metrics.tokens, metrics.canvases, metrics.decoderForwards, generationTokensPerSecond,
         metrics.decoderForwards == 0u ? 0.0 : static_cast<double>(metrics.tokens) / metrics.decoderForwards,
         (promptTotals.executeMicros + metrics.encoderExecuteMicros) / 1000.0,
         (promptTotals.syncMicros + metrics.encoderSyncMicros) / 1000.0,
