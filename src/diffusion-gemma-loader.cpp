@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -534,10 +535,13 @@ void loadDiffusionGemmaWeights(
     std::vector<NnByte> weight;
     for (NnUint nodeIndex = 0u; nodeIndex < graph.nodes.size(); ++nodeIndex) {
         const NnNodeConfig &node = graph.nodes[nodeIndex];
-        for (std::size_t i = 0u; i < graph.weights[nodeIndex].size(); ++i) {
+        const std::size_t t = graph.weights[nodeIndex].size();
+        for (std::size_t i = 0u; i < t; ++i) {
             const DiffusionGemmaWeightBinding &binding = graph.weights[nodeIndex][i];
             if (binding.weightIndex >= node.nWeights)
                 throw std::runtime_error("DiffusionGemma binding references an invalid runtime weight");
+            if (nodeIndex == 0u)
+                std::printf("💿 Loading %zu/%zu\n", i + 1u, t);
             const NnSize bytes = node.weights[binding.weightIndex].size.nBytes;
             materializeWeight(model, binding, bytes, &weight);
             if (nodeIndex == 0u)
