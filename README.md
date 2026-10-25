@@ -2,6 +2,15 @@
 
 This project is a fork of [Distributed Llama](https://github.com/b4rtaz/distributed-llama), adapted to run Google's Diffusion Gemma 26B A4B model in a distributed environment. DDLLM supports inference on CPUs with ARM or AVX2 optimizations, as well as on Vulkan-compatible GPUs. It can run inference across 1, 2, 4, or 8 nodes using weights in float32 or Q40 format.
 
+### 🕜 Benchmark
+
+| | Speed | Transfer / token | Transfer / canvas |
+|--|--|--|--|
+| 2 x Raspberry Pi 5 8 GB | 0.353 tokens/s | 7.6 MB | 139.2 MB |
+| 4 x Raspberry Pi 5 8 GB  | 0.709 tokens/s | 22.9 MB | 419.7 MB |
+
+More details [here](https://github.com/b4rtaz/distributed-diffusion-llm/discussions/1).
+
 ### 🔥 Setup
 
 Build the project on the root and worker nodes:
@@ -25,7 +34,7 @@ python3 launch.py
   --model models/diffusion-gemma-q40.ddlm \
   --tokenizer models/diffusion-gemma.ddlt \
   --workers 192.168.1.20:9990 \
-  --prompt "Hello" \
+  --prompt $'<bos><|turn>user\nHello!<turn|>\n<|turn>model\n' \
   --steps 64 \
   --nthreads 8
 ```
