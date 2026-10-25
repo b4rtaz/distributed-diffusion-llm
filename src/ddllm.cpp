@@ -220,20 +220,22 @@ void inference(DiffusionGemmaAppContext *context) {
         });
     const double generationSeconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - generationStart).count();
-    const double generationTokensPerSecond = generationSeconds == 0.0
+    const std::uint64_t canvasTokens =
+        static_cast<std::uint64_t>(metrics.canvases) * context->header->canvasLength;
+    const double canvasTokensPerSecond = generationSeconds == 0.0
         ? 0.0
-        : static_cast<double>(metrics.tokens) / generationSeconds;
+        : static_cast<double>(canvasTokens) / generationSeconds;
     const std::string tail = context->tokenizer->flushDecoder();
     if (!tail.empty()) std::fwrite(tail.data(), 1u, tail.size(), stdout);
     NnSize sent = 0u, received = 0u;
     if (context->network != NULL) context->network->getStats(&sent, &received);
     std::printf("\n\nGeneration\n  tokens: %u\n  canvases: %u\n  decoder forwards: %u\n"
-        "  speed: %.3f tokens/s\n"
+        "  canvas speed: %.3f tokens/s\n"
         "  tokens/decoder forward: %.3f\n"
         "  encoder execute/sync: %.1f / %.1f ms\n"
         "  decoder execute/sync: %.1f / %.1f ms\n"
         "  sent: %zu kB\n  received: %zu kB\n",
-        metrics.tokens, metrics.canvases, metrics.decoderForwards, generationTokensPerSecond,
+        metrics.tokens, metrics.canvases, metrics.decoderForwards, canvasTokensPerSecond,
         metrics.decoderForwards == 0u ? 0.0 : static_cast<double>(metrics.tokens) / metrics.decoderForwards,
         (promptTotals.executeMicros + metrics.encoderExecuteMicros) / 1000.0,
         (promptTotals.syncMicros + metrics.encoderSyncMicros) / 1000.0,
