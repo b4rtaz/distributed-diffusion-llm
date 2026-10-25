@@ -76,39 +76,36 @@ void main() {
         sums[threadIndex * TILE_SIZE_D + dt] = 0.0f;
     }
 
-    [[unroll]] for (uint it = 0; it < TILE_SIZE_X; it++) {
-        const uint inputBlock = threadIndex + it * N_THREADS;
-        if (inputBlock < inputSizeX) {
-            const uint xi = inputOffset + inputBlock;
-            const float xScale = float(x[xi].d);
+    for (uint inputBlock = threadIndex; inputBlock < inputSizeX; inputBlock += N_THREADS) {
+        const uint xi = inputOffset + inputBlock;
+        const float xScale = float(x[xi].d);
+        [[unroll]] for (uint j = 0; j < Q80_Q40_BLOCK_SIZE / 4; j++) {
+            xTemp[j] = vec4(
+                x[xi].qs[j * 2],
+                x[xi].qs[j * 2 + Q80_Q40_BLOCK_SIZE / 2],
+                x[xi].qs[j * 2 + 1],
+                x[xi].qs[j * 2 + 1 + Q80_Q40_BLOCK_SIZE / 2]
+            );
+        }
+
+        [[unroll]] for (uint dt = 0; dt < TILE_SIZE_D; dt++) {
+            if (d + dt >= info.outputSizeX)
+                continue;
+            const uint wi = expertOffset + (d + dt) * inputSizeX + inputBlock;
+            const BlockQ40 wBlock = weight[wi];
+
+            float s = 0.0f;
             [[unroll]] for (uint j = 0; j < Q80_Q40_BLOCK_SIZE / 4; j++) {
-                xTemp[j] = vec4(
-                    x[xi].qs[j * 2],
-                    x[xi].qs[j * 2 + Q80_Q40_BLOCK_SIZE / 2],
-                    x[xi].qs[j * 2 + 1],
-                    x[xi].qs[j * 2 + 1 + Q80_Q40_BLOCK_SIZE / 2]
-                );
+                uint w0 = wBlock.qs[j * 2];
+                uint w1 = wBlock.qs[j * 2 + 1];
+                s += dot(xTemp[j], vec4(
+                    int(w0 & 0xFu) - 8,
+                    int(w0 >> 4) - 8,
+                    int(w1 & 0xFu) - 8,
+                    int(w1 >> 4) - 8
+                ));
             }
-
-            [[unroll]] for (uint dt = 0; dt < TILE_SIZE_D; dt++) {
-                if (d + dt >= info.outputSizeX)
-                    continue;
-                const uint wi = expertOffset + (d + dt) * inputSizeX + inputBlock;
-                const BlockQ40 wBlock = weight[wi];
-
-                float s = 0.0f;
-                [[unroll]] for (uint j = 0; j < Q80_Q40_BLOCK_SIZE / 4; j++) {
-                    uint w0 = wBlock.qs[j * 2];
-                    uint w1 = wBlock.qs[j * 2 + 1];
-                    s += dot(xTemp[j], vec4(
-                        int(w0 & 0xFu) - 8,
-                        int(w0 >> 4) - 8,
-                        int(w1 & 0xFu) - 8,
-                        int(w1 >> 4) - 8
-                    ));
-                }
-                sums[threadIndex * TILE_SIZE_D + dt] += s * xScale * wBlock.d;
-            }
+            sums[threadIndex * TILE_SIZE_D + dt] += s * xScale * wBlock.d;
         }
     }
 

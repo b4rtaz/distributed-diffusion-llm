@@ -860,13 +860,14 @@ static std::vector<NnUint> resolveShaderConstants(const NnOpConfig *opConfig, co
         const NnUint nZ = resolveNumberOfBatchInfoZ(opConfig, inputSize, outputSize);
         consts.push_back(nZ);
     }
-    if (opConfig->code == OP_MATMUL) {
-        if (opConfig->weightSize.floatType == F_Q40) {
-            constexpr NnUint tileSizeX = 2; // Shader constant
-            const NnUint inputBlocks = inputSize.x / Q40_BLOCK_SIZE;
-            assert(inputSize.x % Q40_BLOCK_SIZE == 0u);
-            consts.push_back((inputBlocks + tileSizeX - 1u) / tileSizeX);
-        }
+    if (opConfig->code == OP_MATMUL && opConfig->weightSize.floatType == F_Q40) {
+        constexpr NnUint tileSizeX = 2u; // Shader constant
+        // Keep vocabulary-wide matmuls within portable workgroup and shared-memory limits.
+        constexpr NnUint maxThreads = 256u;
+        const NnUint inputBlocks = inputSize.x / Q40_BLOCK_SIZE;
+        assert(inputSize.x % Q40_BLOCK_SIZE == 0u);
+        consts.push_back(std::min(maxThreads,
+            (inputBlocks + tileSizeX - 1u) / tileSizeX));
     }
     if (opConfig->code == OP_MOE_ROUTE) {
         const NnMoeRouteOpConfig *config = (NnMoeRouteOpConfig *)opConfig->config;
