@@ -220,6 +220,7 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
     }
     case PNTR_BATCH:
     case PNTR_BATCHED_SLICE:
+    case PNTR_BATCHED_GROUP:
     case PNTR_BATCHED_GROUP_SLICE:
     case PNTR_BATCH_Z: {
         ASSERT_EQ(sourceSize->y, netConfig->nBatches);
@@ -251,17 +252,16 @@ std::vector<NnByte *> NnCpuDevice::resolvePointer(NnSize3D *pntrSize, NnPointerC
                     pntr[z * sourceSize->y + y] = &pntr[z * sourceSize->y + y][xSliceBytes * nodeConfig->nodeIndex];
             }
             *pntrSize = size3D(sourceSize->floatType, sourceSize->z, sourceSize->y, xSlice);
-        } else if (pointerConfig->type == PNTR_BATCHED_GROUP_SLICE) {
-            if (sourceSize->z != 1u || pointerConfig->groupCount == 0u || pointerConfig->groupIndex >= pointerConfig->groupCount ||
-                sourceSize->x % (netConfig->nNodes * pointerConfig->groupCount) != 0u)
+        } else if (pointerConfig->type == PNTR_BATCHED_GROUP ||
+                   pointerConfig->type == PNTR_BATCHED_GROUP_SLICE) {
+            if (sourceSize->z != 1u)
                 throw std::invalid_argument("Invalid grouped batched slice dimensions");
-            const NnUint nodeWidth = sourceSize->x / netConfig->nNodes;
-            const NnUint groupWidth = nodeWidth / pointerConfig->groupCount;
-            const NnSize offset = getBytes(sourceSize->floatType,
-                nodeWidth * nodeConfig->nodeIndex + groupWidth * pointerConfig->groupIndex);
+            const NnPointerRange range = resolveBatchedGroupRange(
+                pointerConfig, sourceSize->x, netConfig->nNodes, nodeConfig->nodeIndex);
+            const NnSize offset = getBytes(sourceSize->floatType, range.offset);
             for (NnUint y = 0u; y < sourceSize->y; ++y)
                 pntr[y] += offset;
-            *pntrSize = size2D(sourceSize->floatType, sourceSize->y, groupWidth);
+            *pntrSize = size2D(sourceSize->floatType, sourceSize->y, range.width);
         }
         return pntr;
     }

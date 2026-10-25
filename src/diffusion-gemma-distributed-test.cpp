@@ -1,5 +1,6 @@
 #include "diffusion-gemma-loader.hpp"
 #include "diffusion-gemma-runtime.hpp"
+#include "nn/nn-config-builder.hpp"
 #include "nn/nn-cpu.hpp"
 #include "nn/nn-network.hpp"
 
@@ -61,6 +62,131 @@ struct DistributedResult {
     bool q80Sync;
 };
 
+void fillCollectiveValues(std::vector<float> *values, NnUint nodeIndex,
+    NnUint batches, NnUint elements) {
+    values->resize(batches * elements);
+    for (NnUint batch = 0u; batch < batches; ++batch)
+        for (NnUint element = 0u; element < elements; ++element)
+            (*values)[batch * elements + element] = nodeIndex * 0.25f +
+                (batch % 7u) * 0.01f + element * 0.00001f + (element % 11u) * 0.001f;
+}
+
+void fillCollectiveInput(NnNetExecution *execution, NnFloatType type,
+    NnUint nodeIndex, NnUint batches, NnUint elements) {
+    std::vector<float> values;
+    fillCollectiveValues(&values, nodeIndex, batches, elements);
+    if (type == F_32) {
+        std::memcpy(execution->pipes[0], values.data(), values.size() * sizeof(float));
+    } else if (type == F_Q80) {
+        quantizeF32toQ80(values.data(),
+            reinterpret_cast<NnBlockQ80 *>(execution->pipes[0]),
+            batches * elements, 1u, 0u);
+    } else {
+        throw std::invalid_argument("Unsupported collective test type");
+    }
+}
+
+void runCollectiveWorker(std::uint32_t port, NnUint nodeIndex,
+    NnNetConfig *net, NnNodeConfig *node, NnFloatType type,
+    NnUint batches, NnUint elements,
+    std::exception_ptr *error, std::vector<float> *result) {
+    try {
+        std::unique_ptr<NnNetwork> network =
+            NnNetwork::serve("127.0.0.1", static_cast<int>(port));
+        NnNetExecution execution(1u, net);
+        execution.setBatchSize(batches);
+        fillCollectiveInput(&execution, type, nodeIndex, batches, elements);
+        NnNetworkNodeSynchronizer synchronizer(network.get(), &execution, net, node);
+        synchronizer.sync(0u, 1u, 0u);
+        const float *output = reinterpret_cast<const float *>(execution.pipes[1]);
+        result->assign(output, output + batches * elements);
+    } catch (...) {
+        *error = std::current_exception();
+    }
+}
+
+void testBatchedAllReduce(std::uint32_t portBase, NnFloatType type, NnUint nNodes) {
+    const NnUint batches = 256u;
+    const NnUint elements = 2816u;
+    NnNetConfigBuilder netBuilder(nNodes, batches);
+    const NnUint input = netBuilder.addPipe("input", size2D(type, batches, elements));
+    const NnUint output = netBuilder.addPipe("output", size2D(F_32, batches, elements));
+    NnNetConfig net = netBuilder.build();
+    std::unique_ptr<NnNetConfig, void (*)(NnNetConfig *)> netGuard(&net, releaseNetConfig);
+    std::vector<NnNodeConfig> nodes;
+    nodes.reserve(nNodes);
+    for (NnUint nodeIndex = 0u; nodeIndex < nNodes; ++nodeIndex) {
+        NnNodeConfigBuilder nodeBuilder(nodeIndex);
+        NnSegmentConfigBuilder segmentBuilder;
+        segmentBuilder.addAllReduce(input, output);
+        nodeBuilder.addSegment(segmentBuilder.build());
+        nodes.push_back(nodeBuilder.build());
+    }
+
+    std::vector<std::thread> workers;
+    std::vector<std::exception_ptr> errors(nNodes - 1u);
+    std::vector<std::vector<float>> results(nNodes);
+    std::vector<std::string> hostStorage(nNodes - 1u, "127.0.0.1");
+    std::vector<char *> hosts(nNodes - 1u);
+    std::vector<NnUint> ports(nNodes - 1u);
+    for (NnUint worker = 0u; worker < nNodes - 1u; ++worker) {
+        hosts[worker] = const_cast<char *>(hostStorage[worker].c_str());
+        ports[worker] = portBase + worker;
+        workers.push_back(std::thread(runCollectiveWorker, ports[worker], worker + 1u,
+            &net, &nodes[worker + 1u], type, batches, elements,
+            &errors[worker], &results[worker + 1u]));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    std::exception_ptr rootError;
+    try {
+        std::unique_ptr<NnNetwork> network = NnNetwork::connect(nNodes - 1u, hosts.data(), ports.data());
+        NnNetExecution execution(1u, &net);
+        execution.setBatchSize(batches);
+        fillCollectiveInput(&execution, type, 0u, batches, elements);
+        NnNetworkNodeSynchronizer synchronizer(network.get(), &execution, &net, &nodes[0]);
+        synchronizer.sync(0u, 1u, 0u);
+        const float *rootOutput = reinterpret_cast<const float *>(execution.pipes[1]);
+        results[0].assign(rootOutput, rootOutput + batches * elements);
+    } catch (...) {
+        rootError = std::current_exception();
+    }
+    for (std::thread &worker : workers)
+        worker.join();
+    if (rootError)
+        std::rethrow_exception(rootError);
+    for (const std::exception_ptr &error : errors)
+        if (error)
+            std::rethrow_exception(error);
+
+    std::vector<float> expected(batches * elements, 0.0f);
+    for (NnUint contributor = 0u; contributor < nNodes; ++contributor) {
+        std::vector<float> values;
+        fillCollectiveValues(&values, contributor, batches, elements);
+        if (type == F_Q80) {
+            std::vector<NnBlockQ80> packed(values.size() / Q80_BLOCK_SIZE);
+            quantizeF32toQ80(values.data(), packed.data(), values.size(), 1u, 0u);
+            dequantizeQ80toF32(packed.data(), values.data(), values.size(), 1u, 0u);
+        }
+        for (NnUint i = 0u; i < expected.size(); ++i)
+            expected[i] += values[i];
+    }
+    for (NnUint nodeIndex = 0u; nodeIndex < nNodes; ++nodeIndex) {
+        if (results[nodeIndex].size() != batches * elements)
+            throw std::runtime_error("Batched all-reduce returned an invalid result size");
+        for (NnUint i = 0u; i < expected.size(); ++i) {
+            if (results[nodeIndex][i] != expected[i]) {
+                std::fprintf(stderr,
+                    "all-reduce mismatch: type=%s node=%u element=%u expected=%.9g actual=%.9g\n",
+                    floatTypeToString(type), nodeIndex, i, expected[i], results[nodeIndex][i]);
+                throw std::runtime_error("Batched all-reduce mismatch");
+            }
+        }
+    }
+    for (NnNodeConfig &node : nodes)
+        releaseNodeConfig(&node);
+}
+
 NnUint bufferIndex(const NnNodeConfig &node, const std::string &name) {
     for (NnUint i = 0u; i < node.nBuffers; ++i)
         if (name == node.buffers[i].name)
@@ -73,6 +199,13 @@ NnUint pipeIndex(const NnNetConfig &net, const std::string &name) {
         if (name == net.pipes[i].name)
             return i;
     throw std::runtime_error("Missing distributed-test pipe: " + name);
+}
+
+NnUint optionalPipeIndex(const NnNetConfig &net, const std::string &name) {
+    for (NnUint i = 0u; i < net.nPipes; ++i)
+        if (name == net.pipes[i].name)
+            return i;
+    return UINT32_MAX;
 }
 
 std::vector<float> copyBuffer(const NnCpuDevice *cpu, const NnNodeConfig &node, const std::string &name) {
@@ -113,7 +246,14 @@ NodeSnapshot captureNode(
     snapshot.value = copyBuffer(cpu, node, "layer.0.value");
     snapshot.attention = copyBuffer(cpu, node, "layer.0.attention");
     snapshot.attentionContribution = copyBuffer(cpu, node, "local_attention");
-    snapshot.attentionProjection = copyBuffer(cpu, node, "local_input");
+    const NnUint reducedPipe = optionalPipeIndex(net, "attention_reduced");
+    if (reducedPipe != UINT32_MAX) {
+        const float *values = reinterpret_cast<const float *>(execution.pipes[reducedPipe]);
+        snapshot.attentionProjection.assign(values,
+            values + queryLength * net.pipes[reducedPipe].size.x);
+    } else {
+        snapshot.attentionProjection = copyBuffer(cpu, node, "local_input");
+    }
     snapshot.queryWidth = static_cast<std::uint32_t>(snapshot.query.size() / queryLength);
     snapshot.kvWidth = static_cast<std::uint32_t>(snapshot.key.size() / queryLength);
     return snapshot;
@@ -143,7 +283,7 @@ void runWorker(std::uint32_t port, std::exception_ptr *error, NodeSnapshot *snap
         NnWorkerWeightReader weights(&executor, network.get());
         weights.read();
         WorkerDiffusionGemmaRuntime runtime(
-            &execution, &executor, network.get(), node.nSegments, contextCapacity(node));
+            &execution, &executor, network.get(), &net, node.nSegments, contextCapacity(node));
         std::uint32_t forwards = 0u;
         while (!runtime.isFinished) {
             if (runtime.tryRun(0ul) && !runtime.isFinished) {
@@ -637,14 +777,23 @@ int main(int argc, char **argv) {
     initSockets();
     initQuants();
     const std::uint32_t processOffset = static_cast<std::uint32_t>(DDLLM_GETPID()) % 1000u;
+    const std::uint32_t portBase = 20000u + processOffset * 16u;
+    std::fprintf(stderr, "distributed test: batched F32 all-reduce, 4 nodes x 256 rows\n");
+    testBatchedAllReduce(portBase, F_32, 4u);
+    std::fprintf(stderr, "distributed test: batched Q80 all-reduce, 8 nodes x 256 rows\n");
+    testBatchedAllReduce(portBase + 8u, F_Q80, 8u);
+    if (argc == 2 && std::string(argv[1]) == "--collectives") {
+        cleanupSockets();
+        return 0;
+    }
     if (argc == 4 && std::string(argv[1]) == "--checkpoint-nodes") {
         const NnUint nNodes = static_cast<NnUint>(std::strtoul(argv[2], NULL, 10));
-        testCheckpointNodes(argv[3], nNodes, 20000u + processOffset * 16u);
+        testCheckpointNodes(argv[3], nNodes, portBase);
         cleanupSockets();
         return 0;
     }
     if (argc == 3 && std::string(argv[1]) == "--checkpoint") {
-        testCheckpointFormat(argv[2], 20000u + processOffset * 16u);
+        testCheckpointFormat(argv[2], portBase);
         cleanupSockets();
         return 0;
     }

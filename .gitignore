@@ -27,5 +27,5 @@ __pycache__/
 /diffusion-gemma-checkpoint-probe
 
 plan.md
-readme.md
 test*.sh
+*.txt

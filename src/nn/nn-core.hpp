@@ -132,6 +132,7 @@ enum NnPointerType {
     PNTR_RAW,
     PNTR_BATCH,
     PNTR_BATCHED_SLICE,
+    PNTR_BATCHED_GROUP,
     PNTR_BATCHED_GROUP_SLICE,
     PNTR_BATCH_Z,
 };
@@ -140,6 +141,7 @@ enum NnSyncType {
     SYNC_WITH_ROOT, // whole pipe to all nodes
     SYNC_NODE_SLICES, // my slice of pipe to all nodes
     SYNC_NODE_SLICES_EXCEPT_ROOT, // only workers send slices to root, root does not send
+    SYNC_ALL_REDUCE, // reduce local source pipe into an F32 output pipe on every node
 };
 
 enum NnRopeType {
@@ -177,6 +179,11 @@ typedef struct {
 } NnPointerConfig;
 
 typedef struct {
+    NnUint offset;
+    NnUint width;
+} NnPointerRange;
+
+typedef struct {
     NnOpCode code;
     char *name;
     NnUint index;
@@ -194,6 +201,7 @@ typedef struct {
 
 typedef struct {
     NnUint pipeIndex;
+    NnUint outputPipeIndex;
     NnSyncType syncType;
 } NnSyncConfig;
 
@@ -436,7 +444,10 @@ NnSize3D size3D(NnFloatType floatType, NnUint z, NnUint y, NnUint x);
 NnPaddedShard paddedShard(NnUint logicalSize, NnUint nNodes, NnUint nodeIndex, NnUint alignment);
 NnPointerConfig pointerBatchConfig(NnPointerSource source, NnUint index);
 NnPointerConfig pointerBatchedSliceConfig(NnPointerSource source, NnUint index);
+NnPointerConfig pointerBatchedGroupConfig(NnPointerSource source, NnUint index, NnUint groupIndex, NnUint groupCount);
 NnPointerConfig pointerBatchedGroupSliceConfig(NnPointerSource source, NnUint index, NnUint groupIndex, NnUint groupCount);
+NnPointerRange resolveBatchedGroupRange(
+    const NnPointerConfig *config, NnUint sourceWidth, NnUint nNodes, NnUint nodeIndex);
 NnPointerConfig pointerBatchZConfig(NnPointerSource source, NnUint index, NnUint zIndex);
 NnPointerConfig pointerRawConfig(NnPointerSource source, NnUint index);
 bool hasPointerContinuousMemory(NnPointerConfig *config);

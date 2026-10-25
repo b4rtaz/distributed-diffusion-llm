@@ -262,7 +262,7 @@ void runDiffusionGemmaWorker(DiffusionGemmaCliArgs *args) {
             NnExecutor executor(&net, &node, &devices, &execution, &synchronizer, false);
             NnWorkerWeightReader weights(&executor, network.get());
             weights.read();
-            WorkerDiffusionGemmaRuntime runtime(&execution, &executor, network.get(), node.nSegments,
+            WorkerDiffusionGemmaRuntime runtime(&execution, &executor, network.get(), &net, node.nSegments,
                 workerContextCapacity(node));
             if (args->netTurbo) network->setTurbo(true);
             while (!runtime.isFinished)

@@ -90,6 +90,27 @@ static void testCpuGraphInitialization() {
     releaseDiffusionGemmaGraph(&graph);
 }
 
+static void testAllReduceStrategy() {
+    const NnUint nodeCounts[] = {1u, 2u, 4u, 8u};
+    const DiffusionGemmaWeightType weightTypes[] = {
+        DIFFUSION_GEMMA_F32,
+        DIFFUSION_GEMMA_Q40,
+    };
+    for (DiffusionGemmaWeightType weightType : weightTypes) {
+        for (NnUint nNodes : nodeCounts) {
+            DiffusionGemmaHeader h = header(true);
+            h.weightType = weightType;
+            DiffusionGemmaGraph graph = buildDiffusionGemmaGraph(h, nNodes, 4u, 16u);
+            const bool expected = weightType == DIFFUSION_GEMMA_F32
+                ? nNodes >= 4u
+                : nNodes == 8u;
+            assert((graph.pipes.attentionReduced != UINT32_MAX) == expected);
+            assert((graph.pipes.feedForwardReduced != UINT32_MAX) == expected);
+            releaseDiffusionGemmaGraph(&graph);
+        }
+    }
+}
+
 static void testMixWeightLayouts() {
     const DiffusionGemmaWeightType types[] = {DIFFUSION_GEMMA_F32, DIFFUSION_GEMMA_Q40};
     for (NnUint type = 0u; type < 2u; ++type) {
@@ -165,6 +186,7 @@ int main(int argc, char **argv) {
     testProductionShards(4u);
     testProductionShards(8u);
     testCpuGraphInitialization();
+    testAllReduceStrategy();
     testMixWeightLayouts();
     for (int i = 1; i < argc; ++i)
         testLoadedModel(argv[i]);

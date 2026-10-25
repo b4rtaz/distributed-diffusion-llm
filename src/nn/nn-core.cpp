@@ -156,10 +156,40 @@ NnPointerConfig pointerBatchedSliceConfig(NnPointerSource source, NnUint index) 
     return { source, index, PNTR_BATCHED_SLICE, 0u, 0u };
 }
 
+NnPointerConfig pointerBatchedGroupConfig(NnPointerSource source, NnUint index, NnUint groupIndex, NnUint groupCount) {
+    if (groupCount == 0u || groupIndex >= groupCount)
+        throw std::invalid_argument("Invalid batched group");
+    return { source, index, PNTR_BATCHED_GROUP, groupIndex, groupCount };
+}
+
 NnPointerConfig pointerBatchedGroupSliceConfig(NnPointerSource source, NnUint index, NnUint groupIndex, NnUint groupCount) {
     if (groupCount == 0u || groupIndex >= groupCount)
         throw std::invalid_argument("Invalid batched group slice");
     return { source, index, PNTR_BATCHED_GROUP_SLICE, groupIndex, groupCount };
+}
+
+NnPointerRange resolveBatchedGroupRange(
+    const NnPointerConfig *config,
+    NnUint sourceWidth,
+    NnUint nNodes,
+    NnUint nodeIndex) {
+    if (config->type != PNTR_BATCHED_GROUP && config->type != PNTR_BATCHED_GROUP_SLICE)
+        throw std::invalid_argument("Pointer is not a batched group");
+    if (nNodes == 0u || nodeIndex >= nNodes || config->groupCount == 0u ||
+        config->groupIndex >= config->groupCount)
+        throw std::invalid_argument("Invalid batched group configuration");
+
+    const bool sliced = config->type == PNTR_BATCHED_GROUP_SLICE;
+    const NnUint nodeCount = sliced ? nNodes : 1u;
+    if (sourceWidth % (nodeCount * config->groupCount) != 0u)
+        throw std::invalid_argument("Invalid batched group dimensions");
+
+    const NnUint nodeWidth = sourceWidth / nodeCount;
+    const NnUint groupWidth = nodeWidth / config->groupCount;
+    return {
+        (sliced ? nodeWidth * nodeIndex : 0u) + groupWidth * config->groupIndex,
+        groupWidth,
+    };
 }
 
 NnPointerConfig pointerBatchZConfig(NnPointerSource source, NnUint index, NnUint zIndex) {

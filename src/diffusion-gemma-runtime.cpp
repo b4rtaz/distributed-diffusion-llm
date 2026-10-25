@@ -9,6 +9,17 @@
 #include <limits>
 #include <stdexcept>
 
+namespace {
+
+NnUint findPipe(const NnNetConfig *netConfig, const char *name) {
+    for (NnUint i = 0u; i < netConfig->nPipes; ++i)
+        if (std::strcmp(netConfig->pipes[i].name, name) == 0)
+            return i;
+    throw std::runtime_error(std::string("Missing runtime pipe: ") + name);
+}
+
+}
+
 void validateDiffusionGemmaControlPacket(
     const DiffusionGemmaControlPacket &packet,
     std::uint32_t maxBatchSize,
@@ -31,6 +42,8 @@ void validateDiffusionGemmaControlPacket(
         throw std::runtime_error("DiffusionGemma query exceeds context capacity");
     if (packet.prefixLength != packet.absoluteStartPosition || packet.prefixLength > contextCapacity)
         throw std::runtime_error("DiffusionGemma prefix and absolute position are inconsistent");
+    if (!std::isfinite(packet.temperature) || packet.temperature <= 0.0f)
+        throw std::runtime_error("Invalid DiffusionGemma sampling temperature");
     if (packet.plan == DIFFUSION_GEMMA_DECODER_DENOISE && packet.denoisingStep == 0u)
         throw std::runtime_error("Decoder control packet has no denoising step");
 }
@@ -79,6 +92,7 @@ void RootDiffusionGemmaRuntime::forward(
     packet.flags = hasSelfConditioning ? DIFFUSION_GEMMA_CONTROL_SELF_CONDITIONING : 0u;
     packet.canvasIndex = canvasIndex;
     packet.denoisingStep = denoisingStep;
+    packet.temperature = temperature;
     validateDiffusionGemmaControlPacket(packet, graph_->maxBatchSize, graph_->nodes[0].nSegments,
         graph_->contextCapacity);
     if (targetTokens != NULL && targetTokens->size() != tokens.size())
@@ -105,8 +119,17 @@ void RootDiffusionGemmaRuntime::forward(
             samplingCoins_[i] = static_cast<float>(coin);
         }
     }
-    if (network_ != NULL)
+    if (network_ != NULL) {
         network_->writeAll(&packet, sizeof(packet));
+        const NnSize valuesBytes = packet.queryLength * sizeof(float);
+        const bool decoder = plan == DIFFUSION_GEMMA_DECODER_DENOISE;
+        std::vector<NnByte> payload(valuesBytes * (decoder ? 3u : 2u));
+        std::memcpy(payload.data(), tokens_, valuesBytes);
+        std::memcpy(payload.data() + valuesBytes, targetTokens_, valuesBytes);
+        if (decoder)
+            std::memcpy(payload.data() + 2u * valuesBytes, samplingCoins_, valuesBytes);
+        network_->writeAll(payload.data(), payload.size());
+    }
     executor_->forward(range.first, range.last);
 }
 
@@ -164,12 +187,29 @@ WorkerDiffusionGemmaRuntime::WorkerDiffusionGemmaRuntime(
     NnNetExecution *execution,
     NnExecutor *executor,
     NnNetwork *network,
+    NnNetConfig *netConfig,
     std::uint32_t segmentCount,
     std::uint32_t contextCapacity)
     : execution_(execution), executor_(executor), network_(network), segmentCount_(segmentCount),
       contextCapacity_(contextCapacity), packet_(), isFinished(false) {
-    if (execution_ == NULL || executor_ == NULL || network_ == NULL || segmentCount_ == 0u)
+    if (execution_ == NULL || executor_ == NULL || network_ == NULL || netConfig == NULL || segmentCount_ == 0u)
         throw std::invalid_argument("Invalid worker DiffusionGemma runtime");
+    const NnUint tokens = findPipe(netConfig, "tokens");
+    const NnUint positions = findPipe(netConfig, "positions");
+    const NnUint prefixLength = findPipe(netConfig, "prefix_length");
+    const NnUint selfConditioning = findPipe(netConfig, "self_conditioning");
+    const NnUint temperature = findPipe(netConfig, "temperature");
+    const NnUint samplingCoins = findPipe(netConfig, "sampling_coins");
+    const NnUint targetTokens = findPipe(netConfig, "target_tokens");
+    tokens_ = reinterpret_cast<float *>(execution_->pipes[tokens]);
+    positions_ = reinterpret_cast<float *>(execution_->pipes[positions]);
+    prefixLength_ = reinterpret_cast<float *>(execution_->pipes[prefixLength]);
+    selfConditioning_ = reinterpret_cast<float *>(execution_->pipes[selfConditioning]);
+    temperature_ = reinterpret_cast<float *>(execution_->pipes[temperature]);
+    samplingCoins_ = reinterpret_cast<float *>(execution_->pipes[samplingCoins]);
+    targetTokens_ = reinterpret_cast<float *>(execution_->pipes[targetTokens]);
+    selfConditioningBatchBytes_ = netConfig->pipes[selfConditioning].size.nBytes /
+        netConfig->pipes[selfConditioning].size.y;
 }
 
 bool WorkerDiffusionGemmaRuntime::tryRun(unsigned long maxAttempts) {
@@ -181,6 +221,20 @@ bool WorkerDiffusionGemmaRuntime::tryRun(unsigned long maxAttempts) {
         return true;
     }
     execution_->setBatchSize(packet_.queryLength);
+    const NnSize valuesBytes = packet_.queryLength * sizeof(float);
+    const bool decoder = packet_.plan == DIFFUSION_GEMMA_DECODER_DENOISE;
+    std::vector<NnByte> payload(valuesBytes * (decoder ? 3u : 2u));
+    network_->read(ROOT_SOCKET_INDEX, payload.data(), payload.size());
+    std::memcpy(tokens_, payload.data(), valuesBytes);
+    std::memcpy(targetTokens_, payload.data() + valuesBytes, valuesBytes);
+    if (decoder)
+        std::memcpy(samplingCoins_, payload.data() + 2u * valuesBytes, valuesBytes);
+    for (std::uint32_t i = 0u; i < packet_.queryLength; ++i)
+        positions_[i] = static_cast<float>(packet_.absoluteStartPosition + i);
+    *prefixLength_ = static_cast<float>(packet_.prefixLength);
+    *temperature_ = packet_.temperature;
+    if ((packet_.flags & DIFFUSION_GEMMA_CONTROL_SELF_CONDITIONING) == 0u)
+        std::memset(selfConditioning_, 0, packet_.queryLength * selfConditioningBatchBytes_);
     executor_->forward(packet_.segmentFrom, packet_.segmentTo);
     return true;
 }

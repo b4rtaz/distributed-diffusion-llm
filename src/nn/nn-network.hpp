@@ -5,7 +5,7 @@
 
 #define ROOT_SOCKET_INDEX 0
 #define NN_PROTOCOL_MAGIC 0x44444c4du
-#define NN_PROTOCOL_VERSION 5u
+#define NN_PROTOCOL_VERSION 6u
 
 void initSockets();
 void cleanupSockets();
@@ -65,6 +65,7 @@ public:
     void readAck(const NnUint socketIndex);
     bool tryReadWithMaxAttempts(NnUint socketIndex, void *data, NnSize size, unsigned long maxAttempts);
     void writeMany(NnUint n, NnSocketIo *ios);
+    void exchangeMany(NnUint n, NnSocketIo *writes, NnSocketIo *reads);
     void writeAll(void *data, NnSize size);
     void readMany(NnUint n, NnSocketIo *ios);
     void getStats(NnSize *sentBytes, NnSize *recvBytes);

@@ -14,23 +14,36 @@ NnNetExecution::NnNetExecution(NnUint nThreads, NnNetConfig *netConfig) {
     this->batchSize = 0; // This value must be overwritten before calling forward
 
     pipes = new NnByte *[netConfig->nPipes];
+    ownsPipes = new bool[netConfig->nPipes];
     for (NnUint pipeIndex = 0; pipeIndex < netConfig->nPipes; pipeIndex++) {
         NnPipeConfig *pipeConfig = &netConfig->pipes[pipeIndex];
         NnByte *pipe = new NnByte[pipeConfig->size.nBytes];
         std::memset(pipe, 0, pipeConfig->size.nBytes);
         pipes[pipeIndex] = pipe;
+        ownsPipes[pipeIndex] = true;
     }
 }
 
 NnNetExecution::~NnNetExecution() {
     for (NnUint pipeIndex = 0; pipeIndex < nPipes; pipeIndex++)
-        delete[] pipes[pipeIndex];
+        if (ownsPipes[pipeIndex])
+            delete[] pipes[pipeIndex];
     delete[] pipes;
+    delete[] ownsPipes;
 }
 
 void NnNetExecution::setBatchSize(NnUint batchSize) {
     assert(batchSize <= nBatches);
     this->batchSize = batchSize;
+}
+
+void NnNetExecution::bindPipe(NnUint pipeIndex, NnByte *data) {
+    if (pipeIndex >= nPipes || data == nullptr)
+        throw std::invalid_argument("Invalid execution pipe binding");
+    if (ownsPipes[pipeIndex])
+        delete[] pipes[pipeIndex];
+    pipes[pipeIndex] = data;
+    ownsPipes[pipeIndex] = false;
 }
 
 NnExecutorDevice::NnExecutorDevice(NnDevice *device, int segmentFrom, int segmentTo) {

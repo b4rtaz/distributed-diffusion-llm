@@ -338,12 +338,22 @@ std::unique_ptr<NnNetwork> NnNetwork::serve(const char *host, const int port) {
         NnUint socketIndex = i + 1;
         if (i >= nodeIndex) {
             printf("⭕ Socket[%d]: connecting to %s:%d worker\n", socketIndex, host, port);
-            sockets[socketIndex].assign(connectSocket(host, port));
+            const int peerFd = connectSocket(host, port);
+            writeSocket(peerFd, &nodeIndex, sizeof(nodeIndex));
+            sockets[socketIndex].assign(peerFd);
             printf("⭕ Socket[%d]: connected\n", socketIndex);
         } else {
-            printf("⭕ Socket[%d]: wait for %s:%d worker\n", socketIndex, host, port);
-            sockets[socketIndex].assign(acceptSocket(socketSocket.fd));
-            printf("⭕ Socket[%d]: accepted\n", socketIndex);
+            printf("⭕ Waiting for an earlier worker\n");
+            NnSocket peerSocket(acceptSocket(socketSocket.fd));
+            NnUint peerNodeIndex;
+            readSocket(peerSocket.fd, &peerNodeIndex, sizeof(peerNodeIndex));
+            if (peerNodeIndex >= nodeIndex || peerNodeIndex >= nSockets - 1u)
+                throw NnConnectionSocketException("Invalid worker peer identity");
+            const NnUint peerSocketIndex = peerNodeIndex + 1u;
+            if (sockets[peerSocketIndex].fd >= 0)
+                throw NnConnectionSocketException("Duplicate worker peer identity");
+            sockets[peerSocketIndex].assign(peerSocket.release());
+            printf("⭕ Socket[%d]: accepted worker %d\n", peerSocketIndex, peerNodeIndex);
         }
     }
 
@@ -481,6 +491,86 @@ void NnNetwork::writeMany(NnUint n, NnSocketIo *ios) {
     } while (isWriting);
 }
 
+void NnNetwork::exchangeMany(NnUint n, NnSocketIo *writes, NnSocketIo *reads) {
+    for (NnUint i = 0u; i < n; ++i) {
+        assert(writes[i].socketIndex < nSockets);
+        assert(reads[i].socketIndex < nSockets);
+        sentBytes[writes[i].socketIndex] += writes[i].size;
+        recvBytes[reads[i].socketIndex] += reads[i].size;
+    }
+
+    for (;;) {
+        fd_set readSet;
+        fd_set writeSet;
+        FD_ZERO(&readSet);
+        FD_ZERO(&writeSet);
+        int maxFd = -1;
+        bool pending = false;
+        for (NnUint i = 0u; i < n; ++i) {
+            if (writes[i].size > 0u) {
+                const int fd = sockets[writes[i].socketIndex];
+                FD_SET(fd, &writeSet);
+                maxFd = std::max(maxFd, fd);
+                pending = true;
+            }
+            if (reads[i].size > 0u) {
+                const int fd = sockets[reads[i].socketIndex];
+                FD_SET(fd, &readSet);
+                maxFd = std::max(maxFd, fd);
+                pending = true;
+            }
+        }
+        if (!pending)
+            return;
+
+        const int selected = select(maxFd + 1, &readSet, &writeSet, NULL, NULL);
+        if (selected < 0) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR)
+                continue;
+#else
+            if (errno == EINTR)
+                continue;
+#endif
+            throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
+        }
+
+        for (NnUint i = 0u; i < n; ++i) {
+            NnSocketIo *writeIo = &writes[i];
+            const int writeFd = sockets[writeIo->socketIndex];
+            if (writeIo->size > 0u && FD_ISSET(writeFd, &writeSet)) {
+                const NnSize chunk = std::min<NnSize>(writeIo->size, MAX_CHUNK_SIZE);
+                const ssize_t written = send(writeFd, (const char *)writeIo->data, chunk, 0);
+                if (written < 0) {
+                    if (!isEagainError())
+                        throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
+                } else if (written == 0) {
+                    throw NnTransferSocketException(0, "Socket closed");
+                } else {
+                    writeIo->size -= written;
+                    writeIo->data = (const char *)writeIo->data + written;
+                }
+            }
+
+            NnSocketIo *readIo = &reads[i];
+            const int readFd = sockets[readIo->socketIndex];
+            if (readIo->size > 0u && FD_ISSET(readFd, &readSet)) {
+                const NnSize chunk = std::min<NnSize>(readIo->size, MAX_CHUNK_SIZE);
+                const ssize_t received = recv(readFd, (char *)readIo->data, chunk, 0);
+                if (received < 0) {
+                    if (!isEagainError())
+                        throw NnTransferSocketException(SOCKET_LAST_ERRCODE, SOCKET_LAST_ERROR);
+                } else if (received == 0) {
+                    throw NnTransferSocketException(0, "Socket closed");
+                } else {
+                    readIo->size -= received;
+                    readIo->data = (char *)readIo->data + received;
+                }
+            }
+        }
+    }
+}
+
 void NnNetwork::writeAll(void *data, NnSize size) {
     std::vector<NnSocketIo> ios(nSockets);
     for (NnUint i = 0; i < nSockets; i++) {
@@ -567,37 +657,161 @@ static void syncWithRoot(NnNetwork *network, NnByte nodeIndex, NnByte *buffer, N
     }
 }
 
-static void syncNodeSlices(bool onlyFromWorkerToRoot, NnNetwork *network, NnUint nodeIndex, NnUint nNodes, NnByte *buffer, NnSize nBytes, NnUint nThreads, NnUint threadIndex) {
+static NnUint socketPeerNode(NnUint socketIndex, NnUint nodeIndex) {
+    return socketIndex >= nodeIndex ? socketIndex + 1u : socketIndex;
+}
+
+static NnUint peerNodeSocket(NnUint peerNode, NnUint nodeIndex) {
+    assert(peerNode != nodeIndex);
+    return peerNode > nodeIndex ? peerNode - 1u : peerNode;
+}
+
+static void syncNodeSlices(
+    bool onlyFromWorkerToRoot,
+    NnNetwork *network,
+    NnUint nodeIndex,
+    NnUint nNodes,
+    NnByte *buffer,
+    NnSize batchBytes,
+    NnUint batches,
+    NnUint nThreads,
+    NnUint threadIndex) {
     bool isWorker = nodeIndex != 0;
     NnUint nSockets = onlyFromWorkerToRoot && isWorker ? 1 : network->nSockets;
     NnUint nSocketsPerThread = nSockets / nThreads + (nSockets % nThreads > threadIndex ? 1 : 0);
     if (nSocketsPerThread == 0) return;
-    NnSize sliceBytes = nBytes / nNodes;
+    NnSize sliceBytes = batchBytes / nNodes;
+    NnSize transferBytes = sliceBytes * batches;
 
-    std::vector<NnSocketIo> ios(nSocketsPerThread);
-
-    if (!onlyFromWorkerToRoot || isWorker) {
-        NnByte *mySliceData = &buffer[sliceBytes * nodeIndex];
-
-        for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            NnUint socketIndex = threadIndex + i * nThreads;
-            ios[i].socketIndex = socketIndex;
-            ios[i].data = mySliceData;
-            ios[i].size = sliceBytes;
-        }
-        network->writeMany(nSocketsPerThread, &ios[0]);
+    std::vector<NnByte> outgoing(transferBytes);
+    for (NnUint batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        std::memcpy(&outgoing[batchIndex * sliceBytes],
+            &buffer[batchIndex * batchBytes + sliceBytes * nodeIndex], sliceBytes);
     }
 
-    if (!onlyFromWorkerToRoot || !isWorker) {
-        for (NnUint i = 0; i < nSocketsPerThread; i++) {
-            NnUint socketIndex = threadIndex + i * nThreads;
-            NnUint sliceIndex = socketIndex >= nodeIndex ? socketIndex + 1 : socketIndex;
-            NnByte *sliceData = &buffer[sliceBytes * sliceIndex];
-            ios[i].socketIndex = socketIndex;
-            ios[i].data = sliceData;
-            ios[i].size = sliceBytes;
+    std::vector<NnByte> incoming(nSocketsPerThread * transferBytes);
+    std::vector<NnSocketIo> writes(nSocketsPerThread);
+    std::vector<NnSocketIo> reads(nSocketsPerThread);
+
+    for (NnUint i = 0u; i < nSocketsPerThread; ++i) {
+        const NnUint socketIndex = threadIndex + i * nThreads;
+        writes[i] = NnSocketIo{socketIndex, outgoing.data(), transferBytes};
+        reads[i] = NnSocketIo{socketIndex, &incoming[i * transferBytes], transferBytes};
+    }
+
+    if (!onlyFromWorkerToRoot) {
+        network->exchangeMany(nSocketsPerThread, writes.data(), reads.data());
+    } else if (isWorker) {
+        network->writeMany(nSocketsPerThread, writes.data());
+        return;
+    } else {
+        network->readMany(nSocketsPerThread, reads.data());
+    }
+
+    for (NnUint i = 0u; i < nSocketsPerThread; ++i) {
+        const NnUint socketIndex = threadIndex + i * nThreads;
+        const NnUint sliceIndex = socketPeerNode(socketIndex, nodeIndex);
+        for (NnUint batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+            std::memcpy(&buffer[batchIndex * batchBytes + sliceBytes * sliceIndex],
+                &incoming[i * transferBytes + batchIndex * sliceBytes], sliceBytes);
         }
-        network->readMany(nSocketsPerThread, &ios[0]);
+    }
+}
+
+static void syncAllReduce(
+    NnNetwork *network,
+    NnUint nodeIndex,
+    NnUint nNodes,
+    NnByte *input,
+    const NnPipeConfig *inputConfig,
+    NnByte *output,
+    const NnPipeConfig *outputConfig,
+    NnUint batches,
+    NnUint threadIndex) {
+    if (threadIndex != 0u)
+        return;
+    if ((inputConfig->size.floatType != F_Q80 && inputConfig->size.floatType != F_32) ||
+        outputConfig->size.floatType != F_32 ||
+        inputConfig->size.x != outputConfig->size.x ||
+        inputConfig->size.y != outputConfig->size.y || inputConfig->size.x % nNodes != 0u ||
+        network->nSockets + 1u != nNodes)
+        throw std::invalid_argument("Invalid all-reduce pipe configuration");
+
+    const NnUint elements = inputConfig->size.x;
+    const NnUint shardElements = elements / nNodes;
+    if (inputConfig->size.floatType == F_Q80 && shardElements % Q80_BLOCK_SIZE != 0u)
+        throw std::invalid_argument("Q80 all-reduce shard is not block aligned");
+    const NnSize inputBatchBytes = getBytes(inputConfig->size.floatType, elements);
+    const NnSize inputShardBytes = getBytes(inputConfig->size.floatType, shardElements);
+    const NnSize outputBatchBytes = getBytes(outputConfig->size.floatType, elements);
+    const NnSize outputShardBytes = getBytes(outputConfig->size.floatType, shardElements);
+    const NnSize inputTransferBytes = batches * inputShardBytes;
+    const NnSize outputTransferBytes = batches * outputShardBytes;
+    const NnUint peers = network->nSockets;
+
+    std::vector<NnByte> outgoing(peers * inputTransferBytes);
+    std::vector<NnByte> incoming(peers * inputTransferBytes);
+    std::vector<NnSocketIo> writes(peers);
+    std::vector<NnSocketIo> reads(peers);
+    for (NnUint socketIndex = 0u; socketIndex < peers; ++socketIndex) {
+        const NnUint peerNode = socketPeerNode(socketIndex, nodeIndex);
+        NnByte *packed = &outgoing[socketIndex * inputTransferBytes];
+        for (NnUint batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+            std::memcpy(&packed[batchIndex * inputShardBytes],
+                &input[batchIndex * inputBatchBytes + peerNode * inputShardBytes], inputShardBytes);
+        }
+        writes[socketIndex] = NnSocketIo{socketIndex, packed, inputTransferBytes};
+        reads[socketIndex] = NnSocketIo{socketIndex,
+            &incoming[socketIndex * inputTransferBytes], inputTransferBytes};
+    }
+    network->exchangeMany(peers, writes.data(), reads.data());
+
+    std::vector<float> decoded(shardElements);
+    std::vector<float> reduced(shardElements);
+    for (NnUint batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        std::fill(reduced.begin(), reduced.end(), 0.0f);
+        for (NnUint contributor = 0u; contributor < nNodes; ++contributor) {
+            const NnByte *contribution;
+            if (contributor == nodeIndex) {
+                contribution = &input[batchIndex * inputBatchBytes + nodeIndex * inputShardBytes];
+            } else {
+                const NnUint socketIndex = peerNodeSocket(contributor, nodeIndex);
+                contribution = &incoming[socketIndex * inputTransferBytes + batchIndex * inputShardBytes];
+            }
+            const float *values;
+            if (inputConfig->size.floatType == F_Q80) {
+                dequantizeQ80toF32(reinterpret_cast<const NnBlockQ80 *>(contribution),
+                    decoded.data(), shardElements, 1u, 0u);
+                values = decoded.data();
+            } else {
+                values = reinterpret_cast<const float *>(contribution);
+            }
+            for (NnUint i = 0u; i < shardElements; ++i)
+                reduced[i] += values[i];
+        }
+        NnByte *result = &output[batchIndex * outputBatchBytes + nodeIndex * outputShardBytes];
+        std::memcpy(result, reduced.data(), outputShardBytes);
+    }
+
+    outgoing.resize(outputTransferBytes);
+    incoming.resize(peers * outputTransferBytes);
+    for (NnUint batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+        std::memcpy(&outgoing[batchIndex * outputShardBytes],
+            &output[batchIndex * outputBatchBytes + nodeIndex * outputShardBytes], outputShardBytes);
+    }
+    for (NnUint socketIndex = 0u; socketIndex < peers; ++socketIndex) {
+        writes[socketIndex] = NnSocketIo{socketIndex, outgoing.data(), outputTransferBytes};
+        reads[socketIndex] = NnSocketIo{socketIndex,
+            &incoming[socketIndex * outputTransferBytes], outputTransferBytes};
+    }
+    network->exchangeMany(peers, writes.data(), reads.data());
+    for (NnUint socketIndex = 0u; socketIndex < peers; ++socketIndex) {
+        const NnUint peerNode = socketPeerNode(socketIndex, nodeIndex);
+        for (NnUint batchIndex = 0u; batchIndex < batches; ++batchIndex) {
+            std::memcpy(&output[batchIndex * outputBatchBytes + peerNode * outputShardBytes],
+                &incoming[socketIndex * outputTransferBytes + batchIndex * outputShardBytes],
+                outputShardBytes);
+        }
     }
 }
 
@@ -618,18 +832,24 @@ void NnNetworkNodeSynchronizer::sync(NnUint segmentIndex, NnUint nThreads, NnUin
         NnSize batchBytes = getBytes(pipeConfig->size.floatType, pipeConfig->size.x);
 
         const NnUint syncBatches = std::min(execution->batchSize, pipeConfig->size.y);
-        for (NnUint batchIndex = 0; batchIndex < syncBatches; batchIndex++) {
-            NnByte *pipeBatch = &pipe[batchIndex * batchBytes];
-
-            if (syncConfig->syncType == SYNC_WITH_ROOT) {
-                syncWithRoot(network, nodeConfig->nodeIndex, pipeBatch, batchBytes, nThreads, threadIndex);
-            } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
-                syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex);
-            } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
-                syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes, pipeBatch, batchBytes, nThreads, threadIndex);
-            } else {
-                throw std::invalid_argument("Unknown sync type");
-            }
+        if (syncConfig->syncType == SYNC_WITH_ROOT) {
+            syncWithRoot(network, nodeConfig->nodeIndex, pipe,
+                batchBytes * syncBatches, nThreads, threadIndex);
+        } else if (syncConfig->syncType == SYNC_NODE_SLICES) {
+            syncNodeSlices(false, network, nodeConfig->nodeIndex, netConfig->nNodes,
+                pipe, batchBytes, syncBatches, nThreads, threadIndex);
+        } else if (syncConfig->syncType == SYNC_NODE_SLICES_EXCEPT_ROOT) {
+            syncNodeSlices(true, network, nodeConfig->nodeIndex, netConfig->nNodes,
+                pipe, batchBytes, syncBatches, nThreads, threadIndex);
+        } else if (syncConfig->syncType == SYNC_ALL_REDUCE) {
+            if (syncConfig->outputPipeIndex >= netConfig->nPipes)
+                throw std::invalid_argument("All-reduce output pipe is outside the network configuration");
+            NnPipeConfig *outputConfig = &netConfig->pipes[syncConfig->outputPipeIndex];
+            syncAllReduce(network, nodeConfig->nodeIndex, netConfig->nNodes,
+                pipe, pipeConfig, execution->pipes[syncConfig->outputPipeIndex], outputConfig,
+                syncBatches, threadIndex);
+        } else {
+            throw std::invalid_argument("Unknown sync type");
         }
     }
 }
@@ -704,6 +924,7 @@ void NnRootConfigWriter::writeNode(NnUint socketIndex, NnNodeConfig *config) {
         for (NnUint syncIndex = 0; syncIndex < segmentConfig->nSyncs; syncIndex++) {
             NnSyncConfig *syncConfig = &segmentConfig->syncs[syncIndex];
             network->write(socketIndex, &syncConfig->pipeIndex, sizeof(syncConfig->pipeIndex));
+            network->write(socketIndex, &syncConfig->outputPipeIndex, sizeof(syncConfig->outputPipeIndex));
             network->write(socketIndex, &syncConfig->syncType, sizeof(syncConfig->syncType));
         }
         for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
@@ -800,6 +1021,7 @@ NnNodeConfig NnWorkerConfigReader::readNode() {
             for (NnUint syncIndex = 0; syncIndex < segmentConfig->nSyncs; syncIndex++) {
                 NnSyncConfig *syncConfig = &segmentConfig->syncs[syncIndex];
                 network->read(ROOT_SOCKET_INDEX, &syncConfig->pipeIndex, sizeof(syncConfig->pipeIndex));
+                network->read(ROOT_SOCKET_INDEX, &syncConfig->outputPipeIndex, sizeof(syncConfig->outputPipeIndex));
                 network->read(ROOT_SOCKET_INDEX, &syncConfig->syncType, sizeof(syncConfig->syncType));
             }
         }

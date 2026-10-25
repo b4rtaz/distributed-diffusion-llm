@@ -309,8 +309,9 @@ void NnVulkanBuffer::write(const NnByte *data, const NnSize offset, const NnSize
     assert(offset + size <= bufferSize);
 
     if (isHostVisible && hostPointer != nullptr) {
+        if (data == &hostPointer[offset])
+            return;
         std::memcpy(&hostPointer[offset], data, size);
-        context->device.flushMappedMemoryRanges({ { deviceMemory, offset, (vk::DeviceSize)size } });
         VULKAN_TRACE("Wrote %zu bytes to host visible buffer", size);
     } else {
         copier->allocate(size);
@@ -328,8 +329,9 @@ void NnVulkanBuffer::read(NnByte *data, const NnSize offset, const NnSize size) 
     assert(offset + size <= bufferSize);
 
     if (isHostVisible && hostPointer != nullptr) {
-        context->device.invalidateMappedMemoryRanges({ {deviceMemory, offset, (vk::DeviceSize)size} });
-        std::memcpy(data, hostPointer, size);
+        if (data == &hostPointer[offset])
+            return;
+        std::memcpy(data, &hostPointer[offset], size);
 
         VULKAN_TRACE("Read %zu bytes from host visible buffer", size);
     } else {
@@ -375,12 +377,14 @@ NnVulkanDeviceData::NnVulkanDeviceData(NnVulkanBufferFactory *bufferFactory, NnN
 {
     for (NnUint i = 0; i < netConfig->nPipes; i++) {
         const NnPipeConfig *config = &netConfig->pipes[i];
-        const bool isSliceable = config->size.z == 1u;
+        const bool isSliceable = config->size.z == 1u &&
+            config->size.y == netConfig->nBatches;
         pipes[i] = bufferFactory->create(config->name, config->size.nBytes, isSliceable, vk::BufferUsageFlagBits::eStorageBuffer, true);
     }
     for (NnUint i = 0; i < nodeConfig->nBuffers; i++) {
         const NnBufferConfig *config = &nodeConfig->buffers[i];
-        const bool isSliceable = config->size.z == 1u;
+        const bool isSliceable = config->size.z == 1u &&
+            config->size.y == netConfig->nBatches;
         buffers[i] = bufferFactory->create(config->name, config->size.nBytes, isSliceable, vk::BufferUsageFlagBits::eStorageBuffer, false);
     }
     for (NnUint i = 0; i < nodeConfig->nWeights; ++i) {
@@ -458,13 +462,12 @@ NnUint NnVulkanDeviceData::resolveBufferBatchOffset(NnPointerConfig *config, NnU
         assert(sizeX % netConfig->nNodes == 0);
         return offsetZ + sizeX * batchIndex + (sizeX / netConfig->nNodes) * nodeConfig->nodeIndex;
     }
-    if (config->type == PNTR_BATCHED_GROUP_SLICE) {
-        if (bufferSize.z != 1u || config->groupCount == 0u || config->groupIndex >= config->groupCount ||
-            sizeX % (netConfig->nNodes * config->groupCount) != 0u)
+    if (config->type == PNTR_BATCHED_GROUP || config->type == PNTR_BATCHED_GROUP_SLICE) {
+        if (bufferSize.z != 1u)
             throw std::invalid_argument("Invalid grouped Vulkan batched slice dimensions");
-        const NnUint nodeWidth = sizeX / netConfig->nNodes;
-        const NnUint groupWidth = nodeWidth / config->groupCount;
-        return sizeX * batchIndex + nodeWidth * nodeConfig->nodeIndex + groupWidth * config->groupIndex;
+        const NnPointerRange range = resolveBatchedGroupRange(
+            config, sizeX, netConfig->nNodes, nodeConfig->nodeIndex);
+        return sizeX * batchIndex + range.offset;
     }
     throw std::runtime_error("Cannot determine buffer offset");
 }
@@ -488,11 +491,11 @@ NnUint NnVulkanDeviceData::resolveBufferBatchWidth(NnPointerConfig *config) {
         assert(sizeX % netConfig->nNodes == 0);
         return sizeX / netConfig->nNodes;
     }
-    if (config->type == PNTR_BATCHED_GROUP_SLICE) {
-        if (bufferSize.z != 1u || config->groupCount == 0u || config->groupIndex >= config->groupCount ||
-            sizeX % (netConfig->nNodes * config->groupCount) != 0u)
+    if (config->type == PNTR_BATCHED_GROUP || config->type == PNTR_BATCHED_GROUP_SLICE) {
+        if (bufferSize.z != 1u)
             throw std::invalid_argument("Invalid grouped Vulkan batched slice dimensions");
-        return sizeX / (netConfig->nNodes * config->groupCount);
+        return resolveBatchedGroupRange(
+            config, sizeX, netConfig->nNodes, nodeConfig->nodeIndex).width;
     }
     throw std::runtime_error("Cannot determine buffer width");
 }
@@ -521,7 +524,15 @@ NnVulkanDevice::NnVulkanDevice(NnUint gpuIndex, NnNetConfig *netConfig, NnNodeCo
     netConfig(netConfig),
     nodeConfig(nodeConfig),
     netExecution(netExecution)
-{}
+{
+    for (NnUint pipeIndex = 0u; pipeIndex < netConfig->nPipes; ++pipeIndex) {
+        NnByte *mapped = data.pipes[pipeIndex]->tryGetMappedPointer();
+        if (mapped != nullptr) {
+            std::memcpy(mapped, netExecution->pipes[pipeIndex], netConfig->pipes[pipeIndex].size.nBytes);
+            netExecution->bindPipe(pipeIndex, mapped);
+        }
+    }
+}
 
 NnVulkanDevice::~NnVulkanDevice() {}
 
@@ -1223,6 +1234,22 @@ NnVulkanDeviceSegment::NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanS
     commandBuffer = cmdBuffers.front();
 
     resolveBuffersToSync(buffersToSync, opBufferAccesses);
+
+    for (NnUint opIndex = 0u; opIndex < segmentConfig->nOps; ++opIndex) {
+        for (const NnOpBufferAccess &access : opBufferAccesses[opIndex]) {
+            if (access.type != ACCESS_READONLY)
+                continue;
+            for (NnUint pipeIndex = 0u; pipeIndex < netConfig->nPipes; ++pipeIndex) {
+                if (access.buffer == data->pipes[pipeIndex].get() &&
+                    std::find(inputPipes.begin(), inputPipes.end(), pipeIndex) == inputPipes.end())
+                    inputPipes.push_back(pipeIndex);
+            }
+        }
+        const NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
+        if (opConfig->output.source == SRC_PIPE &&
+            std::find(outputPipes.begin(), outputPipes.end(), opConfig->output.pointerIndex) == outputPipes.end())
+            outputPipes.push_back(opConfig->output.pointerIndex);
+    }
 }
 
 NnVulkanDeviceSegment::~NnVulkanDeviceSegment() {
@@ -1262,25 +1289,12 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
 
     // TODO: refactor this block
     {
-        for (NnUint i = 0; i < netConfig->nPreSyncs; i++) {
-            NnPreSyncConfig *preSyncConfig = &netConfig->preSyncs[i];
-            NnByte *pipeData = netExecution->pipes[preSyncConfig->pipeIndex];
-            NnVulkanBuffer *buffer = data->pipes[preSyncConfig->pipeIndex].get();
-            const NnUint pipeBatches = netConfig->pipes[preSyncConfig->pipeIndex].size.y;
+        for (NnUint pipeIndex : inputPipes) {
+            NnByte *pipeData = netExecution->pipes[pipeIndex];
+            NnVulkanBuffer *buffer = data->pipes[pipeIndex].get();
+            const NnUint pipeBatches = netConfig->pipes[pipeIndex].size.y;
             buffer->write(pipeData, 0u,
                 buffer->calcSliceSize(std::min(batchSize, pipeBatches), pipeBatches));
-        }
-
-        for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
-            NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
-            if (opConfig->input.source == SRC_PIPE) {
-                NnByte *pipeData = netExecution->pipes[opConfig->input.pointerIndex];
-                NnVulkanBuffer *buffer = data->pipes[opConfig->input.pointerIndex].get();
-                const NnSize transferSize = opConfig->input.type == PNTR_RAW
-                    ? buffer->bufferSize
-                    : buffer->calcSliceSize(batchSize, netConfig->nBatches);
-                buffer->write(pipeData, 0u, transferSize);
-            }
         }
     }
 
@@ -1358,22 +1372,16 @@ void NnVulkanDeviceSegment::forward(NnUint opIndex, NnUint nThreads, NnUint thre
     vk::SubmitInfo submitInfo(0, nullptr, nullptr, 1, &commandBuffer);
     context->queue.submit({ submitInfo }, fence);
     assert(context->device.waitForFences({ fence }, true, uint64_t(-1)) == vk::Result::eSuccess);
-
     context->device.resetFences({ fence });
     VULKAN_TRACE("Forwarded");
 
     // TODO: refactor this block
     {
-        for (NnUint opIndex = 0; opIndex < segmentConfig->nOps; opIndex++) {
-            NnOpConfig *opConfig = &segmentConfig->ops[opIndex];
-            if (opConfig->output.source == SRC_PIPE) {
-                NnByte *pipeData = netExecution->pipes[opConfig->output.pointerIndex];
-                NnVulkanBuffer *buffer = data->pipes[opConfig->output.pointerIndex].get();
-                const NnSize transferSize = opConfig->output.type == PNTR_RAW
-                    ? buffer->bufferSize
-                    : buffer->calcSliceSize(batchSize, netConfig->nBatches);
-                buffer->read(pipeData, 0u, transferSize);
-            }
+        for (NnUint pipeIndex : outputPipes) {
+            NnByte *pipeData = netExecution->pipes[pipeIndex];
+            NnVulkanBuffer *buffer = data->pipes[pipeIndex].get();
+            buffer->read(pipeData, 0u,
+                buffer->calcSliceSize(batchSize, netConfig->nBatches));
         }
     }
 

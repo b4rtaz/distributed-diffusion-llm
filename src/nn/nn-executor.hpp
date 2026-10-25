@@ -40,11 +40,13 @@ public:
     NnUint nThreads;
     NnUint nPipes;
     NnByte **pipes;
+    bool *ownsPipes;
     NnUint batchSize;
     NnUint nBatches;
     NnNetExecution(NnUint nThreads, NnNetConfig *netConfig);
     ~NnNetExecution();
     void setBatchSize(NnUint batchSize);
+    void bindPipe(NnUint pipeIndex, NnByte *data);
 };
 
 enum NnExecutorStepType {

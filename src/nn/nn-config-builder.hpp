@@ -136,7 +136,11 @@ public:
     };
 
     void addSync(NnUint pipeIndex, NnSyncType syncType) {
-        syncs.push_back({ pipeIndex, syncType });
+        syncs.push_back({ pipeIndex, pipeIndex, syncType });
+    }
+
+    void addAllReduce(NnUint inputPipeIndex, NnUint outputPipeIndex) {
+        syncs.push_back({ inputPipeIndex, outputPipeIndex, SYNC_ALL_REDUCE });
     }
 
     NnSegmentConfig build() {
@@ -145,11 +149,15 @@ public:
         if (segment.nOps > 0) {
             segment.ops = new NnOpConfig[segment.nOps];
             std::copy(ops.begin(), ops.end(), segment.ops);
+        } else {
+            segment.ops = nullptr;
         }
         segment.nSyncs = syncs.size();
         if (segment.nSyncs > 0) {
             segment.syncs = new NnSyncConfig[segment.nSyncs];
             std::copy(syncs.begin(), syncs.end(), segment.syncs);
+        } else {
+            segment.syncs = nullptr;
         }
         return segment;
     }

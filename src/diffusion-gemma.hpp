@@ -99,7 +99,9 @@ struct DiffusionGemmaGraphPipes {
     NnUint targetTokens;
     NnUint inputSync;
     NnUint attentionSync;
+    NnUint attentionReduced;
     NnUint feedForwardSync;
+    NnUint feedForwardReduced;
     NnUint vocabularyMaxSync;
     NnUint embeddingMixSync;
     NnUint samplerStatsSync;

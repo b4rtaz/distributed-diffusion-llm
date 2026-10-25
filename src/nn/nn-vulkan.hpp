@@ -64,6 +64,7 @@ public:
     void read(NnByte *data);
     void read(NnByte *data, const NnSize offset, const NnSize size);
     NnSize calcSliceSize(const NnSize nominator, const NnSize denominator);
+    NnByte *tryGetMappedPointer() const { return hostPointer; }
 };
 
 class NnVulkanBufferFactory {
@@ -166,6 +167,8 @@ private:
     vk::PipelineCache pipelineCache;
     vk::CommandBuffer commandBuffer;
     std::vector<std::vector<NnVulkanBuffer *>> buffersToSync;
+    std::vector<NnUint> inputPipes;
+    std::vector<NnUint> outputPipes;
     NnUint lastBatchSize;
 public:
     NnVulkanDeviceSegment(NnVulkanContext *context, NnVulkanStagingCopier *copier, NnVulkanBufferFactory *bufferFactory, NnVulkanDeviceData *data, NnNetConfig *netConfig, NnUint segmentIndex, NnSegmentConfig *segmentConfig, NnNetExecution *netExecution);

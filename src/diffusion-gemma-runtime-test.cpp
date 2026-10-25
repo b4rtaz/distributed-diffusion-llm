@@ -15,6 +15,7 @@ static DiffusionGemmaControlPacket validPacket() {
     packet.segmentFrom = 8u;
     packet.segmentTo = 18u;
     packet.denoisingStep = 4u;
+    packet.temperature = 1.0f;
     return packet;
 }
 
@@ -43,6 +44,9 @@ int main() {
     assert(rejects(packet));
     packet = validPacket();
     packet.denoisingStep = 0u;
+    assert(rejects(packet));
+    packet = validPacket();
+    packet.temperature = 0.0f;
     assert(rejects(packet));
     packet = validPacket();
     packet.command = DIFFUSION_GEMMA_CONTROL_STOP;

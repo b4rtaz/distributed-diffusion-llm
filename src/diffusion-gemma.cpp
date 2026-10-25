@@ -7,6 +7,24 @@
 
 namespace {
 
+bool shouldUseReduceScatterAllReduce(
+    NnFloatType transferType,
+    NnUint nNodes,
+    NnUint elements) {
+    if ((transferType != F_32 && transferType != F_Q80) || nNodes <= 1u ||
+        elements % nNodes != 0u)
+        return false;
+
+    const NnUint shardElements = elements / nNodes;
+    if (shardElements % getBlockSize(transferType) != 0u)
+        return false;
+
+    const NnSize gatheredBytesPerPeer = getBytes(transferType, elements);
+    const NnSize reducedBytesPerPeer = getBytes(transferType, shardElements) +
+        getBytes(F_32, shardElements);
+    return reducedBytesPerPeer < gatheredBytesPerPeer;
+}
+
 struct LayerBuffers {
     NnUint query;
     NnUint key;
@@ -26,6 +44,7 @@ struct NodeBuilder {
     NnFloatType weightType;
     NnFloatType transferType;
     NnFloatType matmulInputType;
+    bool reduceScatterAllReduce;
     const DiffusionGemmaGraphPipes &pipes;
     NnNodeConfigBuilder node;
     std::vector<DiffusionGemmaWeightBinding> bindings;
@@ -87,11 +106,13 @@ struct NodeBuilder {
         NnUint index,
         NnUint maxBatch,
         NnUint contextCapacity,
+        bool useReduceScatterAllReduce,
         const DiffusionGemmaGraphPipes &graphPipes)
         : h(header), nNodes(count), nodeIndex(index), batches(maxBatch), context(contextCapacity),
           weightType(header.weightType == DIFFUSION_GEMMA_Q40 ? F_Q40 : F_32),
           transferType(header.weightType == DIFFUSION_GEMMA_Q40 ? F_Q80 : F_32),
           matmulInputType(header.weightType == DIFFUSION_GEMMA_Q40 ? F_Q80 : F_32),
+          reduceScatterAllReduce(useReduceScatterAllReduce),
           pipes(graphPipes), node(index) {
         addBuffers();
         addWeights();
@@ -374,17 +395,8 @@ struct NodeBuilder {
         node.addSegment(s.build());
     }
 
-    void addControlSegment(bool decoder) {
+    void addControlSegment(bool) {
         NnSegmentConfigBuilder s;
-        s.addSync(pipes.tokens, SYNC_WITH_ROOT);
-        s.addSync(pipes.positions, SYNC_WITH_ROOT);
-        s.addSync(pipes.prefixLength, SYNC_WITH_ROOT);
-        s.addSync(pipes.temperature, SYNC_WITH_ROOT);
-        s.addSync(pipes.targetTokens, SYNC_WITH_ROOT);
-        if (decoder) {
-            s.addSync(pipes.selfConditioning, SYNC_WITH_ROOT);
-            s.addSync(pipes.samplingCoins, SYNC_WITH_ROOT);
-        }
         node.addSegment(s.build());
     }
 
@@ -407,13 +419,23 @@ struct NodeBuilder {
     }
 
     void finalizeFeedForward(NnSegmentConfigBuilder &s, NnUint layer, bool decoder) {
-        s.addOp(OP_MERGE_SUM, "feed_forward.reduce", layer,
-            pointerBatchConfig(SRC_PIPE, pipes.feedForwardSync), pointerBatchConfig(SRC_BUFFER, branches),
-            size0(), NnMergeSumOpCodeConfig{2u});
-        addNorm(s, pointerBatchZConfig(SRC_BUFFER, branches, 0u), pointerBatchZConfig(SRC_BUFFER, branches, 0u),
+        const bool directReducedInput = reduceScatterAllReduce;
+        const NnPointerConfig denseInput = directReducedInput
+            ? pointerBatchedGroupConfig(SRC_PIPE, pipes.feedForwardReduced, 0u, 2u)
+            : pointerBatchZConfig(SRC_BUFFER, branches, 0u);
+        const NnPointerConfig moeInput = directReducedInput
+            ? pointerBatchedGroupConfig(SRC_PIPE, pipes.feedForwardReduced, 1u, 2u)
+            : pointerBatchZConfig(SRC_BUFFER, branches, 1u);
+        if (!directReducedInput) {
+            s.addOp(OP_MERGE_SUM, "feed_forward.reduce", layer,
+                pointerBatchConfig(SRC_PIPE, pipes.feedForwardSync),
+                pointerBatchConfig(SRC_BUFFER, branches),
+                size0(), NnMergeSumOpCodeConfig{2u});
+        }
+        addNorm(s, denseInput, pointerBatchZConfig(SRC_BUFFER, branches, 0u),
             layerOffset(layer, "post_feedforward_layernorm_1.weight"),
             "layers." + std::to_string(layer) + ".post_feedforward_layernorm_1.weight", h.hiddenSize);
-        addNorm(s, pointerBatchZConfig(SRC_BUFFER, branches, 1u), pointerBatchZConfig(SRC_BUFFER, branches, 1u),
+        addNorm(s, moeInput, pointerBatchZConfig(SRC_BUFFER, branches, 1u),
             layerOffset(layer, "post_feedforward_layernorm_2.weight"),
             "layers." + std::to_string(layer) + ".post_feedforward_layernorm_2.weight", h.hiddenSize);
         s.addOp(OP_CAST, "feed_forward.copy_dense", layer,
@@ -505,8 +527,14 @@ struct NodeBuilder {
         addMatmul(s, p + "self_attn.o_proj.weight", b.quantAttention, localAttention,
             layerOffset(layer, "self_attn.o_proj.weight"), size2D(weightType, q, h.hiddenSize));
         s.addOp(OP_CAST, "attention.pack", layer,
-            pointerBatchConfig(SRC_BUFFER, localAttention), pointerBatchedSliceConfig(SRC_PIPE, pipes.attentionSync), size0(), NnCastOpCodeConfig{});
-        s.addSync(pipes.attentionSync, SYNC_NODE_SLICES);
+            pointerBatchConfig(SRC_BUFFER, localAttention),
+            reduceScatterAllReduce ? pointerBatchConfig(SRC_PIPE, pipes.attentionSync)
+                                  : pointerBatchedSliceConfig(SRC_PIPE, pipes.attentionSync),
+            size0(), NnCastOpCodeConfig{});
+        if (reduceScatterAllReduce)
+            s.addAllReduce(pipes.attentionSync, pipes.attentionReduced);
+        else
+            s.addSync(pipes.attentionSync, SYNC_NODE_SLICES);
         node.addSegment(s.build());
     }
 
@@ -515,10 +543,17 @@ struct NodeBuilder {
         const NnPaddedShard dense = denseShard();
         const NnPaddedShard moe = moeShard();
         NnSegmentConfigBuilder s;
-        s.addOp(OP_MERGE_SUM, "attention.reduce", layer,
-            pointerBatchConfig(SRC_PIPE, pipes.attentionSync), pointerBatchConfig(SRC_BUFFER, localInput),
-            size0(), NnMergeSumOpCodeConfig{1u});
-        addNorm(s, pointerBatchConfig(SRC_BUFFER, localInput), pointerBatchConfig(SRC_BUFFER, norm),
+        const bool directReducedInput = reduceScatterAllReduce;
+        const NnPointerConfig attentionInput = directReducedInput
+            ? pointerBatchConfig(SRC_PIPE, pipes.attentionReduced)
+            : pointerBatchConfig(SRC_BUFFER, localInput);
+        if (!directReducedInput) {
+            s.addOp(OP_MERGE_SUM, "attention.reduce", layer,
+                pointerBatchConfig(SRC_PIPE, pipes.attentionSync),
+                pointerBatchConfig(SRC_BUFFER, localInput),
+                size0(), NnMergeSumOpCodeConfig{1u});
+        }
+        addNorm(s, attentionInput, pointerBatchConfig(SRC_BUFFER, norm),
             layerOffset(layer, "post_attention_layernorm.weight"), p + "post_attention_layernorm.weight", h.hiddenSize);
         s.addOp(OP_MERGE_ADD, "attention.residual", layer,
             pointerBatchConfig(SRC_BUFFER, norm), pointerBatchConfig(SRC_BUFFER, x), size0(), NnMergeAddOpCodeConfig{});
@@ -583,10 +618,19 @@ struct NodeBuilder {
             size0(), NnMoeMergeOpConfig{
                 h.activeExpertCount, expertWeights, expertRouteLayout});
         s.addOp(OP_CAST, "feed_forward.pack_dense", layer,
-            pointerBatchConfig(SRC_BUFFER, localDense), pointerBatchedGroupSliceConfig(SRC_PIPE, pipes.feedForwardSync, 0u, 2u), size0(), NnCastOpCodeConfig{});
+            pointerBatchConfig(SRC_BUFFER, localDense),
+            reduceScatterAllReduce ? pointerBatchedGroupConfig(SRC_PIPE, pipes.feedForwardSync, 0u, 2u)
+                                  : pointerBatchedGroupSliceConfig(SRC_PIPE, pipes.feedForwardSync, 0u, 2u),
+            size0(), NnCastOpCodeConfig{});
         s.addOp(OP_CAST, "feed_forward.pack_moe", layer,
-            pointerBatchConfig(SRC_BUFFER, localMoe), pointerBatchedGroupSliceConfig(SRC_PIPE, pipes.feedForwardSync, 1u, 2u), size0(), NnCastOpCodeConfig{});
-        s.addSync(pipes.feedForwardSync, SYNC_NODE_SLICES);
+            pointerBatchConfig(SRC_BUFFER, localMoe),
+            reduceScatterAllReduce ? pointerBatchedGroupConfig(SRC_PIPE, pipes.feedForwardSync, 1u, 2u)
+                                  : pointerBatchedGroupSliceConfig(SRC_PIPE, pipes.feedForwardSync, 1u, 2u),
+            size0(), NnCastOpCodeConfig{});
+        if (reduceScatterAllReduce)
+            s.addAllReduce(pipes.feedForwardSync, pipes.feedForwardReduced);
+        else
+            s.addSync(pipes.feedForwardSync, SYNC_NODE_SLICES);
         node.addSegment(s.build());
     }
 
@@ -754,8 +798,18 @@ DiffusionGemmaGraph buildDiffusionGemmaGraph(
     graph.pipes.samplingCoins = net.addPipe("sampling_coins", size2D(F_32, maxBatchSize, 1u));
     graph.pipes.targetTokens = net.addPipe("target_tokens", size2D(F_32, maxBatchSize, 1u));
     graph.pipes.inputSync = net.addPipe("input_sync", size2D(transferType, maxBatchSize, nNodes * header.hiddenSize));
-    graph.pipes.attentionSync = net.addPipe("attention_sync", size2D(transferType, maxBatchSize, nNodes * header.hiddenSize));
-    graph.pipes.feedForwardSync = net.addPipe("feed_forward_sync", size2D(transferType, maxBatchSize, nNodes * 2u * header.hiddenSize));
+    const bool reduceScatterAllReduce = shouldUseReduceScatterAllReduce(
+        transferType, nNodes, header.hiddenSize);
+    graph.pipes.attentionSync = net.addPipe("attention_sync", size2D(transferType, maxBatchSize,
+        (reduceScatterAllReduce ? 1u : nNodes) * header.hiddenSize));
+    graph.pipes.attentionReduced = reduceScatterAllReduce
+        ? net.addPipe("attention_reduced", size2D(F_32, maxBatchSize, header.hiddenSize))
+        : UINT32_MAX;
+    graph.pipes.feedForwardSync = net.addPipe("feed_forward_sync", size2D(transferType, maxBatchSize,
+        (reduceScatterAllReduce ? 1u : nNodes) * 2u * header.hiddenSize));
+    graph.pipes.feedForwardReduced = reduceScatterAllReduce
+        ? net.addPipe("feed_forward_reduced", size2D(F_32, maxBatchSize, 2u * header.hiddenSize))
+        : UINT32_MAX;
     graph.pipes.vocabularyMaxSync = net.addPipe("vocabulary_max_sync", size2D(F_32, maxBatchSize, nNodes));
     const NnUint mixWidth = ((header.hiddenSize + 2u + 31u) / 32u) * 32u;
     graph.pipes.embeddingMixSync = net.addPipe("embedding_mix_sync", size2D(transferType, maxBatchSize, nNodes * mixWidth));
@@ -779,7 +833,8 @@ DiffusionGemmaGraph buildDiffusionGemmaGraph(
     graph.nodes.reserve(nNodes);
     graph.weights.reserve(nNodes);
     for (NnUint nodeIndex = 0u; nodeIndex < nNodes; ++nodeIndex) {
-        NodeBuilder builder(header, nNodes, nodeIndex, maxBatchSize, contextCapacity, graph.pipes);
+        NodeBuilder builder(header, nNodes, nodeIndex, maxBatchSize, contextCapacity,
+            reduceScatterAllReduce, graph.pipes);
         builder.addPath(false);
         builder.addPath(true);
         graph.nodes.push_back(builder.node.build());

@@ -12,7 +12,7 @@ class NnNetExecution;
 class NnNetwork;
 
 #define DIFFUSION_GEMMA_CONTROL_MAGIC 0x44474350u
-#define DIFFUSION_GEMMA_CONTROL_VERSION 1u
+#define DIFFUSION_GEMMA_CONTROL_VERSION 2u
 
 enum DiffusionGemmaControlCommand {
     DIFFUSION_GEMMA_CONTROL_FORWARD = 0,
@@ -36,6 +36,7 @@ struct DiffusionGemmaControlPacket {
     std::uint32_t flags;
     std::uint32_t canvasIndex;
     std::uint32_t denoisingStep;
+    float temperature;
 };
 
 void validateDiffusionGemmaControlPacket(
@@ -110,6 +111,14 @@ private:
     std::uint32_t segmentCount_;
     std::uint32_t contextCapacity_;
     DiffusionGemmaControlPacket packet_;
+    float *tokens_;
+    float *positions_;
+    float *prefixLength_;
+    float *selfConditioning_;
+    float *temperature_;
+    float *samplingCoins_;
+    float *targetTokens_;
+    NnSize selfConditioningBatchBytes_;
 
 public:
     bool isFinished;
@@ -117,6 +126,7 @@ public:
         NnNetExecution *execution,
         NnExecutor *executor,
         NnNetwork *network,
+        NnNetConfig *netConfig,
         std::uint32_t segmentCount,
         std::uint32_t contextCapacity);
     bool tryRun(unsigned long maxAttempts = 10000ul);
