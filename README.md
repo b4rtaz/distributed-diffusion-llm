@@ -9,7 +9,7 @@ This project is a fork of [Distributed Llama](https://github.com/b4rtaz/distribu
 | 2 x Raspberry Pi 5 8 GB | 0.353 tokens/s | 7.6 MB | 139.2 MB |
 | 4 x Raspberry Pi 5 8 GB  | 0.709 tokens/s | 22.9 MB | 419.7 MB |
 
-More details [here](https://github.com/b4rtaz/distributed-diffusion-llm/discussions/1).
+More details [here](https://b4rtaz.github.io/articles/2026/diffusion-llms-distributed-inference/).
 
 ### 🔥 Setup
 
